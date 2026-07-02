@@ -142,7 +142,7 @@ class StateStore:
 class Mailer:
     def __init__(self) -> None:
         self.host = os.getenv("SMTP_HOST", "")
-        self.port = int(os.getenv("SMTP_PORT", "465"))
+        self.port = int(os.getenv("SMTP_PORT", "465") or "465")
         self.user = os.getenv("SMTP_USER", "")
         self.password = os.getenv("SMTP_PASSWORD", "")
         self.sender = os.getenv("MAIL_FROM", self.user)
@@ -385,7 +385,7 @@ class LocalETFStrategy:
         buys = sorted(target_codes - current)
         holds = sorted(current & target_codes)
 
-        holdings_amount = int(os.getenv("HOLDINGS_AMOUNT", "1000"))
+        holdings_amount = int(os.getenv("HOLDINGS_AMOUNT", "1000") or "1000")
         trades: list[str] = []
         if not dry_run:
             for code in sells:
