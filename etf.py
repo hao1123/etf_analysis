@@ -170,7 +170,8 @@ class Mailer:
             return
         errors = self.configuration_errors()
         if errors:
-            raise RuntimeError("邮件配置不完整: " + ", ".join(errors))
+            LOGGER.warning("邮件配置不完整，跳过邮件发送: %s", ", ".join(errors))
+            return
         message = EmailMessage()
         message["Subject"] = subject
         message["From"] = self.sender
