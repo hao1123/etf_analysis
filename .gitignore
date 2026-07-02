@@ -1,0 +1,19 @@
+# 敏感配置（含 SMTP 密码、飞书 Webhook）
+.env.etf
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 行情缓存与运行日志（可重新生成，不入库）
+data/cache/
+data/logs/
+data/replay/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/

@@ -1,0 +1,96 @@
+name: ETF Strategy
+
+on:
+  schedule:
+    # UTC 时间，北京时间 = UTC+8
+    - cron: '0 1 * * 1-5'    # 09:00 北京 → morning
+    - cron: '40 1 * * 1-5'   # 09:40 北京 → weak
+    - cron: '10 5 * * 1-5'   # 13:10 北京 → rebalance
+    - cron: '10 7 * * 1-5'   # 15:10 北京 → reset
+    - cron: '30 7 * * 1-5'   # 15:30 北京 → close
+  workflow_dispatch:
+    inputs:
+      job:
+        description: '要执行的任务'
+        required: true
+        type: choice
+        default: 'morning'
+        options:
+          - morning
+          - weak
+          - rebalance
+          - reset
+          - close
+          - stop
+      dry_run:
+        description: 'Dry-run 模式（只打印不发通知）'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: etf-strategy
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      MAIL_FROM: ${{ secrets.MAIL_FROM }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
+      SMTP_SSL: '1'
+      SMTP_STARTTLS: '0'
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+      FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+      HOLDINGS_AMOUNT: ${{ secrets.HOLDINGS_AMOUNT }}
+      ETF_USE_SYSTEM_PROXY: '0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: etf-data-${{ github.run_id }}
+          restore-keys: etf-data-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-etf.txt
+
+      - name: Determine job
+        id: job
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            JOB="${{ github.event.inputs.job }}"
+          else
+            SCHEDULE="${{ github.event.schedule }}"
+            case "$SCHEDULE" in
+              "0 1 * * 1-5")   JOB="morning" ;;
+              "40 1 * * 1-5")  JOB="weak" ;;
+              "10 5 * * 1-5")  JOB="rebalance" ;;
+              "10 7 * * 1-5")  JOB="reset" ;;
+              "30 7 * * 1-5")  JOB="close" ;;
+              *)               JOB="morning" ;;
+            esac
+          fi
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+          echo "Selected job: $JOB"
+
+      - name: Run ETF job
+        run: |
+          DRY_FLAG=""
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then
+            DRY_FLAG="--dry-run"
+          fi
+          python etf.py once "${{ steps.job.outputs.job }}" $DRY_FLAG
