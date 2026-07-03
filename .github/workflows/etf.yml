@@ -1,13 +1,6 @@
 name: ETF Strategy
 
 on:
-  schedule:
-    # UTC 时间，北京时间 = UTC+8
-    - cron: '0 1 * * 1-5'    # 09:00 北京 → morning
-    - cron: '40 1 * * 1-5'   # 09:40 北京 → weak
-    - cron: '10 5 * * 1-5'   # 13:10 北京 → rebalance
-    - cron: '10 7 * * 1-5'   # 15:10 北京 → reset
-    - cron: '30 7 * * 1-5'   # 15:30 北京 → close
   workflow_dispatch:
     inputs:
       job:
@@ -71,19 +64,7 @@ jobs:
       - name: Determine job
         id: job
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            JOB="${{ github.event.inputs.job }}"
-          else
-            SCHEDULE="${{ github.event.schedule }}"
-            case "$SCHEDULE" in
-              "0 1 * * 1-5")   JOB="morning" ;;
-              "40 1 * * 1-5")  JOB="weak" ;;
-              "10 5 * * 1-5")  JOB="rebalance" ;;
-              "10 7 * * 1-5")  JOB="reset" ;;
-              "30 7 * * 1-5")  JOB="close" ;;
-              *)               JOB="morning" ;;
-            esac
-          fi
+          JOB="${{ github.event.inputs.job }}"
           echo "job=$JOB" >> "$GITHUB_OUTPUT"
           echo "Selected job: $JOB"
 
