@@ -96,6 +96,8 @@ class MarketDataHub:
         self._event_lock = threading.Lock()
         self._intraday_lock = threading.Lock()
         self._last_intraday_request = 0.0
+        self._history_lock = threading.Lock()
+        self._last_history_request = 0.0
         self._provider_failures: dict[str, int] = {}
         self._disabled_until: dict[str, float] = {}
 
@@ -139,6 +141,7 @@ class MarketDataHub:
             return cached.tail(count).reset_index(drop=True)
         providers: list[tuple[str, Callable[[], pd.DataFrame], str | None]] = [
             ("东方财富直连历史", lambda: self._history_eastmoney(code, count), "em_history"),
+            ("新浪财经历史", lambda: self._history_sina(code, count), None),
             ("腾讯财经历史", lambda: self._history_tencent(code, count), None),
             ("AkShare/东方财富历史", lambda: self._history_akshare(code, count), "ak_history"),
         ]
@@ -147,7 +150,7 @@ class MarketDataHub:
             if circuit_key and time.monotonic() < self._disabled_until.get(circuit_key, 0):
                 continue
             try:
-                frame = self._retry(label, provider, attempts=1)
+                frame = self._retry(label, provider, attempts=3)
                 frame = normalize_history(frame)
                 frame.to_csv(cache, index=False)
                 if circuit_key:
@@ -158,7 +161,7 @@ class MarketDataHub:
                 if circuit_key:
                     failures = self._provider_failures.get(circuit_key, 0) + 1
                     self._provider_failures[circuit_key] = failures
-                    if failures >= 3:
+                    if failures >= 5:
                         self._disabled_until[circuit_key] = time.monotonic() + 300
         cached = self._read_history_cache(cache)
         if cached is not None:
@@ -532,12 +535,17 @@ class MarketDataHub:
             "fields1": "f1,f2,f3,f4,f5,f6,f7,f8",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         }
-        response = self.session.get(
-            url,
-            params=params,
-            timeout=self.request_timeout,
-            headers={"Referer": "https://quote.eastmoney.com/"},
-        )
+        with self._history_lock:
+            wait_seconds = 0.15 - (time.monotonic() - self._last_history_request)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=self.request_timeout,
+                headers={"Referer": "https://quote.eastmoney.com/"},
+            )
+            self._last_history_request = time.monotonic()
         response.raise_for_status()
         data = response.json().get("data") or {}
         rows = [item.split(",") for item in data.get("klines") or []]
@@ -566,6 +574,46 @@ class MarketDataHub:
         width = max(len(row) for row in rows)
         columns = ["date", "open", "close", "high", "low", "volume", "amount"][:width]
         return pd.DataFrame([row[:width] for row in rows], columns=columns)
+
+    def _history_sina(self, code: str, count: int) -> pd.DataFrame:
+        symbol = exchange_code(code)
+        url = "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {
+            "symbol": symbol,
+            "scale": "240",
+            "datalen": str(count),
+            "ma": "no",
+        }
+        response = self.session.get(
+            url,
+            params=params,
+            timeout=self.request_timeout,
+            headers={"Referer": "https://finance.sina.com.cn/"},
+        )
+        response.raise_for_status()
+        text = response.text.strip()
+        if not text.startswith("["):
+            match = re.search(r"\((\[.*\])\)", text, re.DOTALL)
+            if not match:
+                raise DataSourceError("新浪历史格式异常")
+            text = match.group(1)
+        rows_data = json.loads(text)
+        if not rows_data:
+            raise DataSourceError("新浪无K线")
+        frame = pd.DataFrame(rows_data)
+        if "day" in frame.columns:
+            frame = frame.rename(columns={"day": "date"})
+        if "date" not in frame.columns:
+            raise DataSourceError("新浪历史缺日期列")
+        frame["amount"] = (
+            pd.to_numeric(frame.get("volume", 0), errors="coerce")
+            * pd.to_numeric(frame.get("close", 0), errors="coerce")
+        )
+        cols = ["date", "open", "close", "high", "low", "volume", "amount"]
+        for col in cols:
+            if col not in frame.columns:
+                frame[col] = None
+        return frame[cols]
 
     def _intraday_eastmoney(self, code: str) -> pd.DataFrame:
         secid = ("1." if exchange_code(code).startswith("sh") else "0.") + plain_code(code)

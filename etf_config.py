@@ -4,6 +4,61 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+
+FUND_COMPANIES = sorted({
+    "易方达", "广发", "华夏", "华安", "嘉实", "富国", "招商", "鹏华", "南方",
+    "汇添富", "国泰", "平安", "银华", "天弘", "建信", "工银", "华泰柏瑞",
+    "博时", "景顺长城", "景顺", "华宝", "申万菱信", "万家", "中欧", "兴证全球",
+    "浙商", "诺安", "前海开源", "泰康", "泰达宏利", "农银汇理", "交银", "东方红",
+    "财通", "华商", "国联", "永赢", "金鹰", "德邦", "创金合信", "西部利得",
+    "圆信永丰", "泓德", "汇安", "诺德", "恒生前海", "华润元大", "大成", "海富通",
+    "摩根", "华泰", "中信", "中银", "兴全", "国信", "长城", "中金", "浙商证券",
+    "东海", "东吴", "浦银安盛", "信达澳亚", "中加", "中航", "中融", "中邮",
+    "中庚", "中信保诚", "中信建投", "中银国际", "中银证券", "九泰", "交银施罗德",
+    "光大保德信", "兴银", "农银", "国投瑞银", "国海富兰克林", "国联安", "国金",
+    "太平", "方正富邦", "民生加银", "汇丰晋信", "银河", "长信", "长安", "长盛",
+    "长江证券", "鹏扬",
+}, key=len, reverse=True)
+
+NOISE_WORDS = sorted({
+    "6666", "8888", "9999", "A类", "AH", "B", "BS", "C", "C类", "CS", "DB",
+    "E", "E类", "ETF", "ETF基金", "ETF联接", "FG", "G60", "GF", "GT", "HGS",
+    "LOF", "LOF基金", "LOF联接", "SG", "SZ", "TF", "TK", "WJ", "YH", "ZS",
+    "ZZ", "板块", "策略", "产业", "场内", "场外", "低波", "基本面", "基金",
+    "精选", "联接", "联接基金", "量化", "龙头", "民企", "民营", "国企", "央企",
+    "智能", "全指", "上市开放式", "指基", "指增", "指数", "指数A", "指数C",
+    "指数ETF", "指数基金", "主题", "增强", "上海", "黄", "30", "50", "100",
+    "300", "500", "1000", "2000", "大", "新", "四川", "浙江", "湖北",
+}, key=len, reverse=True)
+
+EXCLUDED_DYNAMIC_KEYWORDS = sorted({
+    "300", "500", "1000", "2000", "800", "30", "50", "100", "180", "200",
+    "沪深", "中证", "上证", "深证", "深成", "A50", "A100", "A500", "深100",
+    "短融", "可转债", "转债", "双债", "利率债", "国债", "地债", "政金债",
+    "国开债", "基准国债", "新综债", "信用债", "企业债", "公司债", "城投债",
+    "城投", "美元债", "沪公司债", "科创债", "科债", "科创AAA",
+    "自由现金流", "现金流", "现金流E", "现金流基", "现金流TF", "现金流全",
+    "300现金流", "800现金流", "货币", "现金", "快线", "快钱", "中银现金",
+    "500现金", "800现金", "现金800", "现金自由", "现金指数", "全指现金",
+    "现金全指", "ESG", "MSCI", "MS", "债",
+}, key=len, reverse=True)
+
+SPECIAL_GROUPS: list[dict[str, Any]] = sorted([
+    {"name": "香港组",
+     "keywords": sorted(["恒生", "恒指", "港股", "港股通", "H股", "香港", "港", "HKC", "HK", "HGS", "H", "中概", "HS科技"], key=len, reverse=True),
+     "remove_words": sorted(["恒生", "恒指", "港股", "港股通", "H股", "香港", "港", "HKC", "HK", "HGS", "H", "中概", "HS"], key=len, reverse=True)},
+    {"name": "科创组",
+     "keywords": sorted(["科创", "科创板", "科综", "KC", "K C", "双创", "科创创业", "创创"], key=len, reverse=True),
+     "remove_words": sorted(["科创", "科创板", "科综", "KC", "K C", "双创", "科创创业", "创创", "债券", "债汇", "债指", "债沪", "债易", "债基", "债兴", "债摩", "债", "AAA"], key=len, reverse=True)},
+    {"name": "创业组",
+     "keywords": sorted(["创业板", "创业", "创板", "创成长"], key=len, reverse=True),
+     "remove_words": sorted(["创业板", "创业", "创板", "创成长"], key=len, reverse=True)},
+    {"name": "美指组",
+     "keywords": sorted(["标普", "纳指", "纳斯达克"], key=len, reverse=True),
+     "remove_words": sorted(["标普", "纳指", "纳斯达克"], key=len, reverse=True)},
+], key=lambda x: max(len(kw) for kw in x["keywords"]), reverse=True)
 
 
 GLOBAL_ETF_POOL = [
@@ -73,6 +128,7 @@ class StrategyConfig:
     laplace_s_param: float = 0.05
     laplace_min_slope: float = 0.002
     fallback_liquidity_threshold: float = 10_000_000.0
+    liquidity_lookback_days: int = 3
     dynamic_pool_limit: int = 100
     dynamic_prefilter_limit: int = 400
     state_path: Path = Path("data/etf_state.json")

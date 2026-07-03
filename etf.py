@@ -25,7 +25,13 @@ import numpy as np
 import pandas as pd
 import requests
 
-from etf_config import StrategyConfig
+from etf_config import (
+    StrategyConfig,
+    FUND_COMPANIES,
+    NOISE_WORDS,
+    EXCLUDED_DYNAMIC_KEYWORDS,
+    SPECIAL_GROUPS,
+)
 from etf_data import MarketDataHub, Quote, jq_code, plain_code, to_float
 
 
@@ -38,26 +44,6 @@ INDEXES = {
     "创业板指": "399006.XSHE",
     "中证A500": "000510.XSHG",
 }
-
-FUND_COMPANIES = sorted({
-    "易方达", "广发", "华夏", "华安", "嘉实", "富国", "招商", "鹏华",
-    "南方", "汇添富", "国泰", "平安", "银华", "天弘", "建信", "工银",
-    "华泰柏瑞", "博时", "景顺长城", "景顺", "华宝", "申万菱信", "万家",
-    "中欧", "永赢", "大成", "海富通", "摩根", "中信", "中银",
-}, key=len, reverse=True)
-
-NOISE_WORDS = sorted({
-    "ETF基金", "ETF联接", "ETF", "LOF基金", "LOF", "基金", "指数", "联接",
-    "增强", "龙头", "主题", "产业", "策略", "场内", "A类", "C类",
-}, key=len, reverse=True)
-
-EXCLUDED_DYNAMIC_KEYWORDS = sorted({
-    "300", "500", "1000", "2000", "800", "A50", "A100", "A500",
-    "沪深", "中证", "上证", "深证", "深成", "MSCI", "ESG",
-    "短融", "可转债", "转债", "利率债", "国债", "地债", "政金债",
-    "国开债", "信用债", "企业债", "公司债", "城投债", "美元债", "债",
-    "货币", "现金", "快线", "快钱", "自由现金流",
-}, key=len, reverse=True)
 
 
 @dataclass
@@ -87,6 +73,7 @@ class StateStore:
             "last_jobs": {},
             "stop_alerts": {},
             "daily_records": [],
+            "daily_total_amounts": {},
         }
 
     def _load(self) -> dict[str, Any]:
@@ -291,7 +278,7 @@ class LocalETFStrategy:
             f"全市场ETF快照日期：{snapshot_date or '未知'}",
             f"快照总成交额：{total_amount / 1e8:.2f}亿元",
             f"筛选门槛：{threshold / 1e4:.0f}万元",
-            "说明：本地免费源以最近一份全市场快照近似聚宽的3日均值门槛。",
+            f"说明：取近{self.config.liquidity_lookback_days}日全市场ETF日均总成交额/15000，对齐聚宽3日均值门槛。",
             "",
             "【数据源】",
             self.data.source_summary(),
@@ -312,14 +299,28 @@ class LocalETFStrategy:
             selected = self._filter_by_liquidity(
                 self.config.global_pool, histories, float(threshold), now.date()
             )
+            LOGGER.info(
+                "【全球池过滤】使用流动性门槛=日均%.0f万元，保留%d只，剔除%d只",
+                float(threshold) / 1e4, len(selected),
+                len(self.config.global_pool) - len(selected),
+            )
             pool_note = f"走弱期仅保留全球/海外池，共 {len(selected)} 只"
         else:
             histories = self.data.get_histories(self.config.fixed_pool, count=8)
             fixed = self._filter_by_liquidity(
                 self.config.fixed_pool, histories, float(threshold), now.date()
             )
+            LOGGER.info(
+                "【固定池过滤】使用流动性门槛=日均%.0f万元，保留%d只，剔除%d只",
+                float(threshold) / 1e4, len(fixed),
+                len(self.config.fixed_pool) - len(fixed),
+            )
             dynamic = self._dynamic_pool(float(threshold))
             selected = sorted(set(fixed + dynamic))
+            LOGGER.info(
+                "【合并池统计】固定池%d只, 动态池%d只, 合并后%d只",
+                len(fixed), len(dynamic), len(selected),
+            )
             pool_note = (
                 f"正常期固定池 {len(fixed)} 只 + 动态池 {len(dynamic)} 只，"
                 f"合并后 {len(selected)} 只"
@@ -366,6 +367,26 @@ class LocalETFStrategy:
         metrics.sort(key=lambda item: item["momentum_score"], reverse=True)
         filtered = [item for item in metrics if self._passes(item)]
         top_10 = filtered[:10]
+        if top_10:
+            reference_score = top_10[
+                min(self.config.holdings_num, len(top_10)) - 1
+            ]["momentum_score"]
+            ratio = 1.0 if self._is_weak else self.config.score_threshold_ratio
+            threshold_score = reference_score * ratio
+            candidate_count = sum(
+                1 for item in top_10 if item["momentum_score"] >= threshold_score
+            )
+            LOGGER.info(
+                "【候选池选择】第%d名得分%.4f×%.1f=%.4f，候选池%d只ETF",
+                self.config.holdings_num, reference_score, ratio,
+                threshold_score, candidate_count,
+            )
+            for item in top_10[:candidate_count]:
+                LOGGER.info(
+                    "  候选 %s(%s) 得分%.4f",
+                    item["etf_name"], plain_code(item["etf"]),
+                    item["momentum_score"],
+                )
         targets = self._select_targets(top_10)
         if not targets:
             defensive = self.data.get_quotes([self.config.defensive_etf])
@@ -747,20 +768,43 @@ class LocalETFStrategy:
         return bool(self.state.data.get("weak", {}).get("active"))
 
     def _liquidity_threshold(self) -> tuple[float, str | None, float]:
+        lookback = self.config.liquidity_lookback_days
+        daily_totals: dict[str, float] = self.state.data.setdefault(
+            "daily_total_amounts", {}
+        )
+        today_iso = date.today().isoformat()
+        snapshot_total = 0.0
+        snapshot_date = None
         try:
             frame = self.data.get_eastmoney_spot()
             amount = pd.to_numeric(frame["成交额"], errors="coerce").fillna(0)
-            total = float(amount[amount > 0].sum())
-            threshold = total / 15_000 if total > 0 else 0
-            threshold = threshold or self.config.fallback_liquidity_threshold
+            snapshot_total = float(amount[amount > 0].sum())
             dates = frame.get("数据日期")
-            snapshot_date = None
             if dates is not None and not dates.dropna().empty:
                 snapshot_date = str(dates.dropna().iloc[0])
-            return threshold, snapshot_date, total
         except Exception as exc:
-            LOGGER.warning("流动性门槛回退: %s", exc)
-            return self.config.fallback_liquidity_threshold, None, 0.0
+            LOGGER.warning("快照获取失败，仅使用历史累积: %s", exc)
+
+        if snapshot_total > 0:
+            daily_totals[today_iso] = snapshot_total
+            self.state.save()
+
+        recent_amounts = [
+            value for key, value in sorted(daily_totals.items(), reverse=True)
+        ][:lookback]
+        if len(recent_amounts) < lookback and snapshot_total > 0:
+            recent_amounts = [snapshot_total] * lookback
+        if not recent_amounts:
+            LOGGER.warning("流动性门槛回退：无可用数据")
+            return self.config.fallback_liquidity_threshold, snapshot_date, snapshot_total
+        avg_total = sum(recent_amounts) / len(recent_amounts)
+        threshold = avg_total / 15_000 if avg_total > 0 else 0
+        threshold = threshold or self.config.fallback_liquidity_threshold
+        LOGGER.info(
+            "流动性门槛：近%d日均值=%.2f亿元，阈值=%.0f万元",
+            len(recent_amounts), avg_total / 1e8, threshold / 1e4,
+        )
+        return threshold, snapshot_date, snapshot_total
 
     def _update_weak_state(self, today: date) -> tuple[list[str], bool]:
         histories = self.data.get_histories(INDEXES.values(), count=30, workers=4)
@@ -896,6 +940,7 @@ class LocalETFStrategy:
                 }
             except Exception:
                 pass
+        fallback_count = 0
         for code in codes:
             frame = histories.get(code)
             if frame is None:
@@ -903,12 +948,16 @@ class LocalETFStrategy:
             completed = frame[frame["date"] < today].tail(3)
             amounts = pd.to_numeric(completed["amount"], errors="coerce").dropna()
             has_history_amount = len(amounts) > 0
-            if (
-                has_history_amount and float(amounts.mean()) > threshold
-            ) or (
-                not has_history_amount and plain_code(code) in snapshot_liquid
-            ):
+            if has_history_amount:
+                if float(amounts.mean()) > threshold:
+                    selected.append(code)
+            elif plain_code(code) in snapshot_liquid:
                 selected.append(code)
+                fallback_count += 1
+        if fallback_count > 0:
+            LOGGER.info(
+                "固定池流动性过滤：%d 只历史成交额缺失，回退使用快照", fallback_count
+            )
         return selected
 
     def _dynamic_pool(self, threshold: float) -> list[str]:
@@ -916,29 +965,84 @@ class LocalETFStrategy:
             frame = self.data.get_eastmoney_spot().copy()
         except Exception:
             return []
+        total_count = len(frame)
         frame["成交额"] = pd.to_numeric(frame["成交额"], errors="coerce").fillna(0)
-        frame = frame[frame["成交额"] > threshold].nlargest(
-            self.config.dynamic_prefilter_limit, "成交额"
-        )
-        groups: dict[str, dict[str, Any]] = {}
+        frame = frame[frame["成交额"] > threshold]
+        candidates: list[dict[str, Any]] = []
+        excluded_count = 0
         for _, row in frame.iterrows():
             raw_code = str(row["代码"]).zfill(6)
             name = str(row["名称"])
             if any(keyword in name for keyword in EXCLUDED_DYNAMIC_KEYWORDS):
+                excluded_count += 1
                 continue
-            cleaned = clean_fund_name(name)
+            group_name = classify_special(name)
+            candidates.append({
+                "code": jq_code(raw_code),
+                "plain": raw_code,
+                "name": name,
+                "group": group_name,
+                "amount": to_float(row["成交额"]),
+            })
+        LOGGER.info("【动态池更新】全市场ETF总数: %d只", total_count)
+        LOGGER.info("【动态池更新】排除ETF: %d只", excluded_count)
+        group_counts: dict[str, int] = {}
+        for item in candidates:
+            label = item["group"] or "普通组"
+            group_counts[label] = group_counts.get(label, 0) + 1
+        special_total = sum(v for k, v in group_counts.items() if k != "普通组")
+        normal_total = group_counts.get("普通组", 0)
+        LOGGER.info("【动态池更新】特别组分布: %s", group_counts)
+        LOGGER.info("【动态池更新】进入特别组: %d只", special_total)
+        LOGGER.info("【动态池更新】进入普通组: %d只", normal_total)
+        if not candidates:
+            return []
+        histories = self.data.get_histories(
+            [item["code"] for item in candidates],
+            count=8,
+            workers=10,
+        )
+        today = date.today()
+        filtered: list[dict[str, Any]] = []
+        special_filtered = 0
+        normal_filtered = 0
+        for item in candidates:
+            history = histories.get(item["code"])
+            if history is None:
+                continue
+            completed = history[history["date"] < today].tail(3)
+            amounts = pd.to_numeric(completed["amount"], errors="coerce").dropna()
+            if len(amounts) > 0:
+                avg_amount = float(amounts.mean())
+                if avg_amount <= threshold:
+                    if item["group"]:
+                        special_filtered += 1
+                    else:
+                        normal_filtered += 1
+                    continue
+                item["amount"] = avg_amount
+            filtered.append(item)
+        LOGGER.info(
+            "【动态池更新】特别组流动性过滤: %d→%d只",
+            special_total, special_total - special_filtered,
+        )
+        LOGGER.info(
+            "【动态池更新】普通组流动性过滤: %d→%d只",
+            normal_total, normal_total - normal_filtered,
+        )
+        groups: dict[str, dict[str, Any]] = {}
+        for item in filtered:
+            cleaned = clean_name_with_group(item["name"], item["group"])
             if not cleaned:
                 continue
-            prefix = special_prefix(name)
-            key = f"{prefix}:{cleaned[:2]}"
-            candidate = {
-                "code": jq_code(raw_code),
-                "amount": to_float(row["成交额"]),
-            }
-            if key not in groups or candidate["amount"] > groups[key]["amount"]:
-                groups[key] = candidate
+            group_label = item["group"] or "普通"
+            key = f"{group_label}:{cleaned[:2]}"
+            if key not in groups or item["amount"] > groups[key]["amount"]:
+                groups[key] = item
         ranked = sorted(groups.values(), key=lambda item: item["amount"], reverse=True)
-        return [item["code"] for item in ranked[:self.config.dynamic_pool_limit]]
+        result = [item["code"] for item in ranked[:self.config.dynamic_pool_limit]]
+        LOGGER.info("【动态池更新完成】动态池共%d只ETF", len(result))
+        return result
 
     def _metrics(
         self,
@@ -1117,25 +1221,33 @@ def calculate_volume_ratio(
     return projected / average if average > 0 else None
 
 
-def clean_fund_name(name: str) -> str:
+def classify_special(name: str) -> str | None:
+    for group in SPECIAL_GROUPS:
+        for keyword in group["keywords"]:
+            if keyword and keyword in name:
+                return group["name"]
+    return None
+
+
+def _special_remove_words(group_name: str | None) -> list[str]:
+    if not group_name:
+        return []
+    for group in SPECIAL_GROUPS:
+        if group["name"] == group_name:
+            return group["remove_words"]
+    return []
+
+
+def clean_name_with_group(name: str, group_name: str | None = None) -> str:
     result = name
     for word in FUND_COMPANIES:
         result = result.replace(word, "")
+    if group_name:
+        for word in _special_remove_words(group_name):
+            result = result.replace(word, "")
     for word in NOISE_WORDS:
         result = result.replace(word, "")
     return result.strip()
-
-
-def special_prefix(name: str) -> str:
-    if any(word in name for word in ("恒生", "港股", "H股", "香港", "中概")):
-        return "香港"
-    if "科创" in name:
-        return "科创"
-    if "创业" in name:
-        return "创业"
-    if any(word in name for word in ("标普", "纳指", "纳斯达克")):
-        return "美指"
-    return "普通"
 
 
 def load_env_file(path: Path) -> None:

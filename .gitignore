@@ -11,9 +11,16 @@ data/cache/
 data/logs/
 data/replay/
 
+# 运行时状态文件（含每日累积数据，不入库）
+data/etf_state.json
+data/etf_state.tmp
+
 # macOS
 .DS_Store
 
 # 编辑器
 .vscode/
 .idea/
+
+# Trae 内部规划文档（不入库）
+.trae/
