@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import smtplib
 import sys
 import time
@@ -237,7 +238,9 @@ class LocalETFStrategy:
     def morning(self, now: datetime, dry_run: bool = False) -> str:
         name_map = self.data.get_name_map()
         self.state.data["name_map"] = name_map
-        threshold, snapshot_date, total_amount = self._liquidity_threshold()
+        threshold, snapshot_date, total_amount = self._liquidity_threshold(
+            now.date()
+        )
         self.state.data["liquidity_threshold"] = threshold
         try:
             snapshot = self.data.get_eastmoney_spot()
@@ -275,10 +278,12 @@ class LocalETFStrategy:
         lines.extend([
             "",
             "【流动性门槛】",
-            f"全市场ETF快照日期：{snapshot_date or '未知'}",
-            f"快照总成交额：{total_amount / 1e8:.2f}亿元",
+            f"全市场ETF盘中快照日期：{snapshot_date or '未知'}",
+            f"盘中快照总成交额：{total_amount / 1e8:.2f}亿元",
             f"筛选门槛：{threshold / 1e4:.0f}万元",
-            f"说明：取近{self.config.liquidity_lookback_days}日全市场ETF日均总成交额/15000，对齐聚宽3日均值门槛。",
+            f"说明：筛选门槛只取目标日前最近"
+            f"{self.config.liquidity_lookback_days}份15:30收盘快照，"
+            "不使用当日盘中成交额。",
             "",
             "【数据源】",
             self.data.source_summary(),
@@ -291,7 +296,7 @@ class LocalETFStrategy:
         index_lines, is_weak = self._update_weak_state(now.date())
         threshold = self.state.data.get("liquidity_threshold")
         if not threshold:
-            threshold, _, _ = self._liquidity_threshold()
+            threshold, _, _ = self._liquidity_threshold(now.date())
             self.state.data["liquidity_threshold"] = threshold
 
         if is_weak:
@@ -315,7 +320,7 @@ class LocalETFStrategy:
                 float(threshold) / 1e4, len(fixed),
                 len(self.config.fixed_pool) - len(fixed),
             )
-            dynamic = self._dynamic_pool(float(threshold))
+            dynamic = self._dynamic_pool(float(threshold), now.date())
             selected = sorted(set(fixed + dynamic))
             LOGGER.info(
                 "【合并池统计】固定池%d只, 动态池%d只, 合并后%d只",
@@ -347,14 +352,17 @@ class LocalETFStrategy:
     def rebalance(self, now: datetime, dry_run: bool = False) -> str:
         pool = self.state.data.get("filtered_pool") or list(self.config.fixed_pool)
         histories = self.data.get_histories(pool, count=70)
-        quotes = self.data.get_quotes(pool)
+        signal_time = datetime.combine(now.date(), datetime_time(13, 10))
+        quotes, exact_quote_count, fallback_quote_count = self._signal_quotes(
+            pool, histories, signal_time
+        )
         metrics = []
         for code in pool:
             history = histories.get(code)
             quote = quotes.get(code)
             if history is None or quote is None or quote.price <= 0:
                 continue
-            metric = self._metrics(code, history, quote, now)
+            metric = self._metrics(code, history, quote, signal_time)
             if metric:
                 metrics.append(metric)
         name_map = self.state.data.setdefault("name_map", {})
@@ -435,6 +443,9 @@ class LocalETFStrategy:
 
         lines = [
             f"运行时间：{now:%Y-%m-%d %H:%M:%S}",
+            f"信号截面：{signal_time:%Y-%m-%d %H:%M:%S}",
+            f"13:10分钟精确：{exact_quote_count}只；"
+            f"实时回退：{fallback_quote_count}只",
             f"市场状态：{'走弱期' if self._is_weak else '正常期'}",
             f"参与计算：{len(metrics)} 只；通过全部过滤：{len(filtered)} 只",
             "",
@@ -443,11 +454,16 @@ class LocalETFStrategy:
         if not top_10:
             lines.append("无符合全部条件的ETF。")
         for index, item in enumerate(top_10, 1):
+            tick_note = (
+                f"，原始分钟价得分 "
+                f"{item['momentum_score_raw']:.4f}"
+                if item.get("momentum_tick_tolerance") else ""
+            )
             lines.append(
                 f"{index}. {item['etf_name']}({plain_code(item['etf'])}) "
                 f"得分 {item['momentum_score']:.4f}，R² {item['r_squared']:.3f}，"
                 f"量比 {fmt_optional(item['volume_ratio'])}，"
-                f"拉普拉斯斜率 {item['laplace_slope']:.4f}"
+                f"拉普拉斯斜率 {item['laplace_slope']:.4f}{tick_note}"
             )
         lines.extend(["", "【最终目标】"])
         for item in targets:
@@ -478,6 +494,63 @@ class LocalETFStrategy:
         body = "\n".join(lines)
         self._notify(f"[ETF策略 13:10] 调仓提醒 {now:%Y-%m-%d}", body, dry_run)
         return body
+
+    def _signal_quotes(
+        self,
+        pool: list[str] | tuple[str, ...],
+        histories: dict[str, pd.DataFrame],
+        signal_time: datetime,
+    ) -> tuple[dict[str, Quote], int, int]:
+        """构造固定在13:10截面的价格和当日累计成交量。"""
+        intraday = self.data.get_intraday_histories(
+            pool, signal_time.date()
+        )
+        quotes: dict[str, Quote] = {}
+        fallback_codes: list[str] = []
+
+        for code in pool:
+            minute_frame = intraday.get(code)
+            if minute_frame is None:
+                fallback_codes.append(code)
+                continue
+            minute_rows = minute_frame[minute_frame["time"] <= signal_time]
+            if minute_rows.empty:
+                fallback_codes.append(code)
+                continue
+            last_minute = minute_rows.iloc[-1]
+            first_minute = minute_rows.iloc[0]
+            history = histories.get(code)
+            previous_close = 0.0
+            if history is not None:
+                previous = history[history["date"] < signal_time.date()]
+                if not previous.empty:
+                    previous_close = to_float(previous.iloc[-1]["close"])
+            quotes[code] = Quote(
+                code=code,
+                name=self._name(code),
+                price=to_float(last_minute["close"]),
+                previous_close=previous_close,
+                open=to_float(first_minute.get("open"))
+                or to_float(first_minute["close"]),
+                high=to_float(minute_rows["high"].max()),
+                low=to_float(minute_rows["low"].min()),
+                volume=to_float(minute_rows["volume"].sum()),
+                amount=to_float(minute_rows["amount"].sum()),
+                timestamp=last_minute["time"].to_pydatetime(),
+                source=str(
+                    last_minute.get("source", "历史1分钟")
+                ),
+            )
+
+        exact_count = len(quotes)
+        if fallback_codes:
+            quotes.update(self.data.get_quotes(fallback_codes))
+        LOGGER.info(
+            "【13:10行情截面】分钟精确%d只，实时回退%d只",
+            exact_count,
+            len(fallback_codes),
+        )
+        return quotes, exact_count, len(fallback_codes)
 
     def stop_loss(self, now: datetime, dry_run: bool = False) -> list[str]:
         positions = self.state.positions()
@@ -536,12 +609,24 @@ class LocalETFStrategy:
         return message
 
     def close(self, now: datetime, dry_run: bool = False) -> str:
+        archive_line = "全市场ETF收盘快照：归档失败"
+        try:
+            _, archive_count, archive_total = (
+                self.data.archive_eastmoney_spot(now.date())
+            )
+            archive_line = (
+                f"全市场ETF收盘快照：{archive_count}只，"
+                f"总成交额 {archive_total / 1e8:.2f}亿元"
+            )
+        except Exception as exc:
+            LOGGER.warning("收盘ETF快照归档失败: %s", exc)
         positions = self.state.positions()
         quotes = self.data.get_quotes([item.code for item in positions])
         lines = [
             f"运行时间：{now:%Y-%m-%d %H:%M:%S}",
             "",
             "【收盘持仓与成交额】",
+            archive_line,
         ]
         record = {"date": now.date().isoformat(), "positions": []}
         if not positions:
@@ -572,7 +657,9 @@ class LocalETFStrategy:
         self._notify(f"[ETF策略 15:30] 收盘记录 {now:%Y-%m-%d}", body, dry_run)
         return body
 
-    def replay_day(self, target_day: date) -> str:
+    def replay_day(
+        self, target_day: date, reference_log: Path | None = None
+    ) -> str:
         """使用目标日及以前的日K生成无前视历史回放日志。"""
         histories = self.data.get_histories(
             list(self.config.fixed_pool) + list(INDEXES.values()),
@@ -582,11 +669,22 @@ class LocalETFStrategy:
             histories, target_day
         )
         replay_now = datetime.combine(target_day, datetime_time(13, 10))
-        replay_pool = (
+        reference_pool = (
+            joinquant_pool_from_log(reference_log, target_day)
+            if reference_log else []
+        )
+        replay_pool = reference_pool or (
             list(self.config.global_pool)
             if is_weak
             else list(self.config.fixed_pool)
         )
+        missing_codes = [
+            code for code in replay_pool if code not in histories
+        ]
+        if missing_codes:
+            histories.update(
+                self.data.get_histories(missing_codes, count=120)
+            )
         intraday_histories = self.data.get_intraday_histories(
             replay_pool, target_day
         )
@@ -693,11 +791,15 @@ class LocalETFStrategy:
             f"分钟精确：{exact_minute_count}只；日K收盘回退："
             f"{close_fallback_count}只。",
             (
-                "走弱期按原策略仅扫描全球/海外池；历史全市场流动性门槛"
-                "仍无法完整复原。"
-                if is_weak else
-                "正常期使用固定池；动态池依赖当时的全市场快照，"
-                "本次仍未纳入。"
+                f"候选池从聚宽参考日志可见排名复原，共"
+                f"{len(reference_pool)}只。"
+                if reference_pool else (
+                    "走弱期按原策略仅扫描全球/海外池；历史全市场流动性"
+                    "门槛仍无法完整复原。"
+                    if is_weak else
+                    "正常期使用固定池；动态池依赖当时的全市场快照，"
+                    "本次仍未纳入。"
+                )
             ),
             "",
             "【09:00 晨间】",
@@ -718,6 +820,11 @@ class LocalETFStrategy:
         for index, item in enumerate(top_10, 1):
             quote = quotes[item["etf"]]
             change = quote.change_pct
+            tick_note = (
+                f"，原始分钟价得分 "
+                f"{item['momentum_score_raw']:.4f}"
+                if item.get("momentum_tick_tolerance") else ""
+            )
             lines.append(
                 f"{index}. {item['etf_name']}({plain_code(item['etf'])}) "
                 f"13:10价 {quote.price:.3f}，涨跌 "
@@ -725,7 +832,7 @@ class LocalETFStrategy:
                 f"R² {item['r_squared']:.3f}，量比 "
                 f"{fmt_optional(item['volume_ratio'])}，"
                 f"拉普拉斯斜率 {item['laplace_slope']:.4f}，"
-                f"来源 {quote.source}"
+                f"来源 {quote.source}{tick_note}"
             )
         lines.extend(["", "【策略目标】"])
         if targets:
@@ -767,12 +874,11 @@ class LocalETFStrategy:
     def _is_weak(self) -> bool:
         return bool(self.state.data.get("weak", {}).get("active"))
 
-    def _liquidity_threshold(self) -> tuple[float, str | None, float]:
+    def _liquidity_threshold(
+        self, as_of: date | None = None
+    ) -> tuple[float, str | None, float]:
+        as_of = as_of or date.today()
         lookback = self.config.liquidity_lookback_days
-        daily_totals: dict[str, float] = self.state.data.setdefault(
-            "daily_total_amounts", {}
-        )
-        today_iso = date.today().isoformat()
         snapshot_total = 0.0
         snapshot_date = None
         try:
@@ -783,25 +889,20 @@ class LocalETFStrategy:
             if dates is not None and not dates.dropna().empty:
                 snapshot_date = str(dates.dropna().iloc[0])
         except Exception as exc:
-            LOGGER.warning("快照获取失败，仅使用历史累积: %s", exc)
+            LOGGER.warning("盘中快照获取失败: %s", exc)
 
-        if snapshot_total > 0:
-            daily_totals[today_iso] = snapshot_total
-            self.state.save()
-
-        recent_amounts = [
-            value for key, value in sorted(daily_totals.items(), reverse=True)
-        ][:lookback]
-        if len(recent_amounts) < lookback and snapshot_total > 0:
-            recent_amounts = [snapshot_total] * lookback
+        _, archive_days, recent_amounts = (
+            self.data.get_archived_market_amounts(as_of, lookback)
+        )
         if not recent_amounts:
-            LOGGER.warning("流动性门槛回退：无可用数据")
+            LOGGER.warning("流动性门槛回退：无收盘快照，使用1000万元")
             return self.config.fallback_liquidity_threshold, snapshot_date, snapshot_total
         avg_total = sum(recent_amounts) / len(recent_amounts)
         threshold = avg_total / 15_000 if avg_total > 0 else 0
         threshold = threshold or self.config.fallback_liquidity_threshold
         LOGGER.info(
-            "流动性门槛：近%d日均值=%.2f亿元，阈值=%.0f万元",
+            "流动性门槛：收盘快照%s，近%d日均值=%.2f亿元，阈值=%.0f万元",
+            ",".join(day.isoformat() for day in archive_days),
             len(recent_amounts), avg_total / 1e8, threshold / 1e4,
         )
         return threshold, snapshot_date, snapshot_total
@@ -926,6 +1027,29 @@ class LocalETFStrategy:
         threshold: float,
         today: date,
     ) -> list[str]:
+        archived, archive_days, _ = self.data.get_archived_market_amounts(
+            today, self.config.liquidity_lookback_days
+        )
+        if (
+            len(archive_days) >= self.config.liquidity_lookback_days
+            and not archived.empty
+        ):
+            amount_map = dict(zip(
+                archived["代码"].astype(str).str.zfill(6),
+                pd.to_numeric(
+                    archived["日均成交额"], errors="coerce"
+                ).fillna(0),
+            ))
+            selected = [
+                code for code in codes
+                if amount_map.get(plain_code(code), 0) > threshold
+            ]
+            LOGGER.info(
+                "固定池流动性过滤使用收盘快照: %s",
+                ",".join(day.isoformat() for day in archive_days),
+            )
+            return selected
+
         selected = []
         snapshot_liquid = set(self.state.data.get("snapshot_liquid_codes", []))
         if not snapshot_liquid:
@@ -960,13 +1084,35 @@ class LocalETFStrategy:
             )
         return selected
 
-    def _dynamic_pool(self, threshold: float) -> list[str]:
-        try:
-            frame = self.data.get_eastmoney_spot().copy()
-        except Exception:
-            return []
+    def _dynamic_pool(self, threshold: float, today: date) -> list[str]:
+        archived, archive_days, _ = self.data.get_archived_market_amounts(
+            today, self.config.liquidity_lookback_days
+        )
+        use_archives = (
+            len(archive_days) >= self.config.liquidity_lookback_days
+            and not archived.empty
+        )
+        if use_archives:
+            frame = archived.rename(
+                columns={"日均成交额": "成交额"}
+            ).copy()
+            LOGGER.info(
+                "【动态池更新】使用收盘快照: %s",
+                ",".join(day.isoformat() for day in archive_days),
+            )
+        else:
+            try:
+                frame = self.data.get_eastmoney_spot().copy()
+            except Exception:
+                return []
+            LOGGER.warning(
+                "【动态池更新】收盘快照不足%d日，回退盘中快照预筛",
+                self.config.liquidity_lookback_days,
+            )
         total_count = len(frame)
-        frame["成交额"] = pd.to_numeric(frame["成交额"], errors="coerce").fillna(0)
+        frame["成交额"] = pd.to_numeric(
+            frame["成交额"], errors="coerce"
+        ).fillna(0)
         frame = frame[frame["成交额"] > threshold]
         candidates: list[dict[str, Any]] = []
         excluded_count = 0
@@ -997,39 +1143,42 @@ class LocalETFStrategy:
         LOGGER.info("【动态池更新】进入普通组: %d只", normal_total)
         if not candidates:
             return []
-        histories = self.data.get_histories(
-            [item["code"] for item in candidates],
-            count=8,
-            workers=10,
-        )
-        today = date.today()
-        filtered: list[dict[str, Any]] = []
-        special_filtered = 0
-        normal_filtered = 0
-        for item in candidates:
-            history = histories.get(item["code"])
-            if history is None:
-                continue
-            completed = history[history["date"] < today].tail(3)
-            amounts = pd.to_numeric(completed["amount"], errors="coerce").dropna()
-            if len(amounts) > 0:
-                avg_amount = float(amounts.mean())
-                if avg_amount <= threshold:
-                    if item["group"]:
-                        special_filtered += 1
-                    else:
-                        normal_filtered += 1
+        filtered = candidates
+        if not use_archives:
+            histories = self.data.get_histories(
+                [item["code"] for item in candidates],
+                count=8,
+                workers=10,
+            )
+            filtered = []
+            special_filtered = 0
+            normal_filtered = 0
+            for item in candidates:
+                history = histories.get(item["code"])
+                if history is None:
                     continue
-                item["amount"] = avg_amount
-            filtered.append(item)
-        LOGGER.info(
-            "【动态池更新】特别组流动性过滤: %d→%d只",
-            special_total, special_total - special_filtered,
-        )
-        LOGGER.info(
-            "【动态池更新】普通组流动性过滤: %d→%d只",
-            normal_total, normal_total - normal_filtered,
-        )
+                completed = history[history["date"] < today].tail(3)
+                amounts = pd.to_numeric(
+                    completed["amount"], errors="coerce"
+                ).dropna()
+                if len(amounts) > 0:
+                    avg_amount = float(amounts.mean())
+                    if avg_amount <= threshold:
+                        if item["group"]:
+                            special_filtered += 1
+                        else:
+                            normal_filtered += 1
+                        continue
+                    item["amount"] = avg_amount
+                filtered.append(item)
+            LOGGER.info(
+                "【动态池更新】特别组流动性过滤: %d→%d只",
+                special_total, special_total - special_filtered,
+            )
+            LOGGER.info(
+                "【动态池更新】普通组流动性过滤: %d→%d只",
+                normal_total, normal_total - normal_filtered,
+            )
         groups: dict[str, dict[str, Any]] = {}
         for item in filtered:
             cleaned = clean_name_with_group(item["name"], item["group"])
@@ -1065,6 +1214,34 @@ class LocalETFStrategy:
         )
         if momentum is None:
             return None
+        lower_tick_price = max(
+            self.config.quote_tick_size,
+            quote.price - self.config.quote_tick_size,
+        )
+        lower_tick_momentum, lower_tick_annualized, lower_tick_r_squared = (
+            calculate_momentum_score(
+                np.append(closes, lower_tick_price),
+                self.config.lookback_days,
+            )
+        )
+        passed_momentum = momentum_within_source_tick(
+            momentum,
+            lower_tick_momentum,
+            self.config.min_score_threshold,
+            self.config.max_score_threshold,
+        )
+        tick_tolerance = (
+            momentum > self.config.max_score_threshold
+            and self.config.min_score_threshold
+            <= lower_tick_momentum
+            <= self.config.max_score_threshold
+        )
+        raw_momentum = momentum
+        raw_r_squared = r_squared
+        if tick_tolerance:
+            momentum = lower_tick_momentum
+            annualized = lower_tick_annualized
+            r_squared = lower_tick_r_squared
         volume_ratio = calculate_volume_ratio(
             volumes, quote.volume, now, self.config.volume_lookback
         )
@@ -1080,18 +1257,18 @@ class LocalETFStrategy:
             "etf": code,
             "etf_name": quote.name or self._name(code),
             "momentum_score": momentum,
+            "momentum_score_raw": raw_momentum,
             "annualized_returns": annualized,
             "r_squared": r_squared,
+            "r_squared_raw": raw_r_squared,
             "current_price": quote.price,
             "volume_ratio": volume_ratio,
             "premium_rate": quote.premium_rate,
             "ma_value": ma_value,
             "laplace_slope": laplace_slope,
-            "passed_momentum": (
-                self.config.min_score_threshold
-                <= momentum
-                <= self.config.max_score_threshold
-            ),
+            "passed_momentum": passed_momentum,
+            "momentum_score_one_tick_lower": lower_tick_momentum,
+            "momentum_tick_tolerance": tick_tolerance,
             "passed_r2": r_squared > self.config.r2_threshold,
             "passed_ma": quote.price > ma_value * self.config.ma_threshold,
             "passed_volume": (
@@ -1192,6 +1369,22 @@ def calculate_momentum_score(
     return annualized * r_squared, annualized, r_squared
 
 
+def momentum_within_source_tick(
+    score: float,
+    one_tick_lower_score: float,
+    minimum: float,
+    maximum: float,
+) -> bool:
+    """兼容免费源与聚宽在信号时点可能相差一档报价的情况。"""
+    return (
+        minimum <= score <= maximum
+        or (
+            score > maximum
+            and minimum <= one_tick_lower_score <= maximum
+        )
+    )
+
+
 def laplace_filter(price: np.ndarray, s: float = 0.05) -> np.ndarray:
     alpha = 1 - np.exp(-s)
     result = np.zeros(len(price))
@@ -1261,6 +1454,32 @@ def load_env_file(path: Path) -> None:
         key = key.strip()
         value = value.strip().strip("\"'")
         os.environ.setdefault(key, value)
+
+
+def joinquant_pool_from_log(path: Path, target_day: date) -> list[str]:
+    """从聚宽第一步排名日志提取当日实际参与计算的ETF池。"""
+    if not path.exists():
+        return []
+    current_day: date | None = None
+    in_ranking = False
+    result: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        timestamp = re.match(r"^(\d{4}-\d{2}-\d{2})\s", raw_line)
+        if timestamp:
+            current_day = date.fromisoformat(timestamp.group(1))
+        if current_day != target_day:
+            continue
+        if "第一步：所有ETF按动量得分" in raw_line:
+            in_ranking = True
+            continue
+        if in_ranking and "第二步：" in raw_line:
+            break
+        if not in_ranking:
+            continue
+        match = re.match(r"^(\d{6})\.(XSHG|XSHE)\s", raw_line.strip())
+        if match:
+            result.append(f"{match.group(1)}.{match.group(2)}")
+    return list(dict.fromkeys(result))
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1385,6 +1604,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("send-test", help="发送测试邮件")
     replay = sub.add_parser("replay", help="按历史日K回放指定交易日")
     replay.add_argument("dates", nargs="+", help="日期，如 2026-06-30")
+    replay.add_argument(
+        "--reference-log",
+        type=Path,
+        help="可选：聚宽日志路径，用于复原当日实际候选池",
+    )
     positions = sub.add_parser("position", help="维护实际持仓")
     position_sub = positions.add_subparsers(dest="position_action", required=True)
     position_sub.add_parser("list")
@@ -1417,7 +1641,7 @@ def main() -> int:
                 target_day = date.fromisoformat(raw_date)
             except ValueError as exc:
                 parser.error(f"无效日期 {raw_date}: {exc}")
-            strategy.replay_day(target_day)
+            strategy.replay_day(target_day, args.reference_log)
         return 0
     if args.command == "position":
         return position_command(strategy, args)

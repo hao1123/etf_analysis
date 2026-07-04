@@ -16,12 +16,15 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 
 import pandas as pd
 import requests
+
+HISTORY_CACHE_VERSION = "qfq_v2"
+SPOT_ARCHIVE_PREFIX = "etf_spot_close_"
 
 warnings.filterwarnings(
     "ignore",
@@ -129,7 +132,10 @@ class MarketDataHub:
         raise DataSourceError(f"{label}失败: {error}") from error
 
     def get_history(self, code: str, count: int = 70) -> pd.DataFrame:
-        cache = self.cache_dir / f"history_{plain_code(code)}.csv"
+        cache = (
+            self.cache_dir
+            / f"history_{HISTORY_CACHE_VERSION}_{plain_code(code)}.csv"
+        )
         cached = self._read_history_cache(cache)
         required_cache_rows = min(count, 30)
         if (
@@ -141,9 +147,9 @@ class MarketDataHub:
             return cached.tail(count).reset_index(drop=True)
         providers: list[tuple[str, Callable[[], pd.DataFrame], str | None]] = [
             ("东方财富直连历史", lambda: self._history_eastmoney(code, count), "em_history"),
-            ("新浪财经历史", lambda: self._history_sina(code, count), None),
             ("腾讯财经历史", lambda: self._history_tencent(code, count), None),
             ("AkShare/东方财富历史", lambda: self._history_akshare(code, count), "ak_history"),
+            ("新浪财经历史", lambda: self._history_sina(code, count), None),
         ]
         errors: list[str] = []
         for label, provider, circuit_key in providers:
@@ -219,7 +225,7 @@ class MarketDataHub:
         if cache.exists():
             try:
                 frame = normalize_intraday(pd.read_csv(cache))
-                if not frame.empty:
+                if intraday_covers_signal(frame, target_day):
                     self._event("历史分钟缓存: 成功")
                     return frame
             except Exception:
@@ -312,6 +318,94 @@ class MarketDataHub:
                 return frame
             raise
 
+    def archive_eastmoney_spot(
+        self, expected_day: date
+    ) -> tuple[Path, int, float]:
+        """归档收盘后的全市场ETF快照，供后续交易日使用。"""
+        frame = self.get_eastmoney_spot(force=True).copy()
+        snapshot_day = spot_frame_date(frame)
+        if snapshot_day is not None and snapshot_day != expected_day:
+            raise DataSourceError(
+                f"ETF快照日期为 {snapshot_day}，预期 {expected_day}"
+            )
+        latest_time = spot_frame_latest_time(frame)
+        if (
+            latest_time is not None
+            and (
+                latest_time.date() != expected_day
+                or latest_time.time() < datetime_time(15, 0)
+            )
+        ):
+            raise DataSourceError(
+                f"ETF快照最新时间为 {latest_time:%Y-%m-%d %H:%M:%S}，"
+                "不是收盘快照"
+            )
+        if "成交额" not in frame.columns:
+            raise DataSourceError("ETF快照缺少成交额")
+        frame["代码"] = frame["代码"].astype(str).str.zfill(6)
+        frame["成交额"] = pd.to_numeric(
+            frame["成交额"], errors="coerce"
+        ).fillna(0)
+        frame["数据日期"] = expected_day.isoformat()
+        archive = self.cache_dir / (
+            f"{SPOT_ARCHIVE_PREFIX}{expected_day.isoformat()}.csv"
+        )
+        frame.to_csv(archive, index=False)
+        total = float(frame.loc[frame["成交额"] > 0, "成交额"].sum())
+        self._event(
+            f"全市场ETF收盘快照归档: {expected_day} {len(frame)}只"
+        )
+        return archive, len(frame), total
+
+    def get_archived_market_amounts(
+        self, before_day: date, count: int = 3
+    ) -> tuple[pd.DataFrame, list[date], list[float]]:
+        """读取目标日前最近若干份收盘快照并计算逐ETF日均成交额。"""
+        archives: list[tuple[date, Path]] = []
+        for path in self.cache_dir.glob(f"{SPOT_ARCHIVE_PREFIX}*.csv"):
+            raw_day = path.stem.removeprefix(SPOT_ARCHIVE_PREFIX)
+            try:
+                archive_day = date.fromisoformat(raw_day)
+            except ValueError:
+                continue
+            if archive_day < before_day:
+                archives.append((archive_day, path))
+        archives = sorted(archives, reverse=True)[:count]
+        if not archives:
+            return pd.DataFrame(), [], []
+
+        frames: list[pd.DataFrame] = []
+        days: list[date] = []
+        totals: list[float] = []
+        for archive_day, path in reversed(archives):
+            try:
+                frame = pd.read_csv(path, dtype={"代码": str})
+            except (OSError, pd.errors.ParserError):
+                continue
+            if not {"代码", "名称", "成交额"}.issubset(frame.columns):
+                continue
+            frame = frame[["代码", "名称", "成交额"]].copy()
+            frame["代码"] = frame["代码"].astype(str).str.zfill(6)
+            frame["成交额"] = pd.to_numeric(
+                frame["成交额"], errors="coerce"
+            ).fillna(0)
+            frame["archive_day"] = archive_day
+            frames.append(frame)
+            days.append(archive_day)
+            totals.append(float(frame.loc[frame["成交额"] > 0, "成交额"].sum()))
+        if not frames:
+            return pd.DataFrame(), [], []
+
+        combined = pd.concat(frames, ignore_index=True)
+        names = combined.groupby("代码", sort=False)["名称"].last()
+        amounts = combined.groupby("代码")["成交额"].sum() / len(frames)
+        result = pd.DataFrame({
+            "代码": amounts.index,
+            "名称": amounts.index.map(names),
+            "日均成交额": amounts.values,
+        }).reset_index(drop=True)
+        return result, days, totals
+
     def get_ths_spot(self, force: bool = False) -> pd.DataFrame:
         if self._ths_spot is not None and not force:
             return self._ths_spot
@@ -384,7 +478,7 @@ class MarketDataHub:
             period="daily",
             start_date=start,
             end_date=end,
-            adjust="",
+            adjust="qfq",
         )
 
     def _eastmoney_spot_direct(self) -> pd.DataFrame:
@@ -528,7 +622,7 @@ class MarketDataHub:
         params = {
             "secid": secid,
             "klt": "101",
-            "fqt": "0",
+            "fqt": "1",
             "lmt": str(count),
             "end": "20500101",
             "iscca": "1",
@@ -573,7 +667,17 @@ class MarketDataHub:
             raise DataSourceError("腾讯无K线")
         width = max(len(row) for row in rows)
         columns = ["date", "open", "close", "high", "low", "volume", "amount"][:width]
-        return pd.DataFrame([row[:width] for row in rows], columns=columns)
+        frame = pd.DataFrame([row[:width] for row in rows], columns=columns)
+        # 腾讯日K成交量以手返回；策略内部统一使用股。
+        frame["volume"] = pd.to_numeric(
+            frame["volume"], errors="coerce"
+        ) * 100
+        if "amount" not in frame.columns:
+            frame["amount"] = (
+                pd.to_numeric(frame["close"], errors="coerce")
+                * frame["volume"]
+            )
+        return frame
 
     def _history_sina(self, code: str, count: int) -> pd.DataFrame:
         symbol = exchange_code(code)
@@ -662,7 +766,7 @@ class MarketDataHub:
                 "symbol": exchange_code(code),
                 "scale": "1",
                 "ma": "no",
-                "datalen": "1023",
+                "datalen": "1200",
             },
             timeout=self.request_timeout,
             headers={"Referer": "https://finance.sina.com.cn/"},
@@ -672,9 +776,8 @@ class MarketDataHub:
         if not rows:
             raise DataSourceError("新浪无分钟行情")
         frame = pd.DataFrame(rows).rename(columns={"day": "time"})
-        frame["volume"] = (
-            pd.to_numeric(frame["volume"], errors="coerce") / 100
-        )
+        # 新浪分钟成交量原始单位为股。
+        frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
         frame["source"] = "新浪历史1分钟"
         frame["average"] = pd.NA
         return frame
@@ -712,7 +815,9 @@ class MarketDataHub:
                     open=to_float(fields[5]),
                     high=to_float(fields[33]),
                     low=to_float(fields[34]),
-                    volume=to_float(fields[6]),
+                    volume=volume_to_shares(
+                        fields[6], to_float(fields[37]) * 10_000, fields[3]
+                    ),
                     amount=to_float(fields[37]) * 10_000,
                     timestamp=timestamp,
                     source="腾讯财经",
@@ -737,7 +842,11 @@ class MarketDataHub:
                 open=to_float(row.get("开盘价")),
                 high=to_float(row.get("最高价")),
                 low=to_float(row.get("最低价")),
-                volume=to_float(row.get("成交量")),
+                volume=volume_to_shares(
+                    row.get("成交量"),
+                    row.get("成交额"),
+                    row.get("最新价"),
+                ),
                 amount=to_float(row.get("成交额")),
                 timestamp=timestamp,
                 source="AkShare/东方财富",
@@ -779,8 +888,31 @@ def normalize_history(frame: pd.DataFrame) -> pd.DataFrame:
     result["date"] = pd.to_datetime(result["date"]).dt.date
     for column in ["open", "close", "high", "low", "volume", "amount"]:
         result[column] = pd.to_numeric(result[column], errors="coerce")
+    result = normalize_frame_volume_to_shares(result)
     result = result.dropna(subset=["date", "close"]).drop_duplicates("date")
     return result.sort_values("date").reset_index(drop=True)
+
+
+def spot_frame_date(frame: pd.DataFrame) -> date | None:
+    for column in ("数据日期", "更新时间"):
+        if column not in frame.columns:
+            continue
+        values = pd.to_datetime(frame[column], errors="coerce").dropna()
+        if not values.empty:
+            return values.iloc[0].date()
+    return None
+
+
+def spot_frame_latest_time(frame: pd.DataFrame) -> datetime | None:
+    if "更新时间" not in frame.columns:
+        return None
+    values = pd.to_datetime(frame["更新时间"], errors="coerce").dropna()
+    if values.empty:
+        return None
+    latest = values.max()
+    if getattr(latest, "tzinfo", None) is not None:
+        latest = latest.tz_localize(None)
+    return latest.to_pydatetime()
 
 
 def normalize_intraday(frame: pd.DataFrame) -> pd.DataFrame:
@@ -804,8 +936,18 @@ def normalize_intraday(frame: pd.DataFrame) -> pd.DataFrame:
     for column in ["open", "close", "high", "low", "volume", "amount", "average"]:
         if column in result.columns:
             result[column] = pd.to_numeric(result[column], errors="coerce")
+    result = normalize_frame_volume_to_shares(result)
     result = result.dropna(subset=["time", "close"]).drop_duplicates("time")
     return result.sort_values("time").reset_index(drop=True)
+
+
+def intraday_covers_signal(frame: pd.DataFrame, target_day: date) -> bool:
+    target = frame[frame["time"].dt.date == target_day]
+    if target.empty:
+        return False
+    first = target["time"].min().time()
+    last = target["time"].max().time()
+    return first <= datetime_time(9, 31) and last >= datetime_time(13, 10)
 
 
 def to_float(value: object) -> float:
@@ -822,3 +964,39 @@ def to_optional_float(value: object) -> float | None:
         return None if pd.isna(number) else number
     except (TypeError, ValueError):
         return None
+
+
+def volume_to_shares(
+    volume: object,
+    amount: object,
+    price: object,
+) -> float:
+    """根据成交额反推成交量单位，并统一转换为股。"""
+    raw_volume = to_float(volume)
+    raw_amount = to_float(amount)
+    raw_price = to_float(price)
+    if raw_volume <= 0 or raw_amount <= 0 or raw_price <= 0:
+        return raw_volume
+    implied_multiplier = raw_amount / (raw_price * raw_volume)
+    if 20 <= implied_multiplier <= 200:
+        return raw_volume * 100
+    return raw_volume
+
+
+def normalize_frame_volume_to_shares(frame: pd.DataFrame) -> pd.DataFrame:
+    """将整段行情的成交量统一为股，兼容不同免费源的股/手口径。"""
+    if not {"volume", "amount", "close"}.issubset(frame.columns):
+        return frame
+    valid = frame[
+        (frame["volume"] > 0)
+        & (frame["amount"] > 0)
+        & (frame["close"] > 0)
+    ]
+    if valid.empty:
+        return frame
+    multipliers = (
+        valid["amount"] / (valid["close"] * valid["volume"])
+    ).replace([float("inf"), float("-inf")], pd.NA).dropna()
+    if not multipliers.empty and 20 <= float(multipliers.median()) <= 200:
+        frame["volume"] = frame["volume"] * 100
+    return frame

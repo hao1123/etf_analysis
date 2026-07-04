@@ -110,6 +110,7 @@ class StrategyConfig:
     max_weak_days: int = 20
     min_score_threshold: float = 0.0
     max_score_threshold: float = 5.0
+    quote_tick_size: float = 0.001
     score_threshold_ratio: float = 0.9
     r2_threshold: float = 0.4
     ma_lookback: int = 10

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,9 +11,22 @@ from etf import (
     StateStore,
     calculate_momentum_score,
     calculate_volume_ratio,
-    clean_fund_name,
+    clean_name_with_group,
+    joinquant_pool_from_log,
     laplace_filter,
+    momentum_within_source_tick,
 )
+from etf_data import (
+    DataSourceError,
+    HISTORY_CACHE_VERSION,
+    MarketDataHub,
+    SPOT_ARCHIVE_PREFIX,
+    intraday_covers_signal,
+    normalize_history,
+    normalize_intraday,
+    volume_to_shares,
+)
+from etf_config import StrategyConfig
 
 
 class ETFStrategyTests(unittest.TestCase):
@@ -43,7 +56,208 @@ class ETFStrategyTests(unittest.TestCase):
         self.assertTrue(1.0 < result[-1] < 3.0)
 
     def test_clean_fund_name(self):
-        self.assertEqual(clean_fund_name("华夏芯片ETF基金"), "芯片")
+        self.assertEqual(
+            clean_name_with_group("华夏芯片ETF基金", None), "芯片"
+        )
+
+    def test_quote_volume_is_normalized_from_lots_to_shares(self):
+        self.assertEqual(
+            volume_to_shares(10_000, 100_000_000, 100),
+            1_000_000,
+        )
+
+    def test_history_volume_keeps_share_unit(self):
+        frame = pd.DataFrame({
+            "date": ["2026-07-02"],
+            "open": [1.0],
+            "close": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "volume": [1_000_000],
+            "amount": [1_000_000],
+        })
+        result = normalize_history(frame)
+        self.assertEqual(result.iloc[0]["volume"], 1_000_000)
+
+    def test_history_cache_version_requires_adjusted_prices(self):
+        self.assertIn("qfq", HISTORY_CACHE_VERSION)
+
+    def test_momentum_upper_bound_allows_only_one_quote_tick(self):
+        self.assertTrue(
+            momentum_within_source_tick(5.0079, 4.9811, 0.0, 5.0)
+        )
+        self.assertFalse(
+            momentum_within_source_tick(5.0149, 5.0059, 0.0, 5.0)
+        )
+        self.assertFalse(
+            momentum_within_source_tick(-0.0001, -0.01, 0.0, 5.0)
+        )
+        self.assertFalse(
+            momentum_within_source_tick(10.0, -1.0, 0.0, 5.0)
+        )
+
+    def test_archived_market_amounts_use_previous_three_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            for raw_day, first, second in [
+                ("2026-06-30", 30.0, 15.0),
+                ("2026-07-01", 60.0, 30.0),
+                ("2026-07-02", 90.0, 45.0),
+            ]:
+                pd.DataFrame({
+                    "代码": ["510300", "159667"],
+                    "名称": ["沪深300ETF", "工业母机ETF"],
+                    "成交额": [first, second],
+                }).to_csv(
+                    cache_dir / f"{SPOT_ARCHIVE_PREFIX}{raw_day}.csv",
+                    index=False,
+                )
+            hub = MarketDataHub(cache_dir)
+            frame, days, totals = hub.get_archived_market_amounts(
+                date(2026, 7, 3), 3
+            )
+            amounts = dict(zip(frame["代码"], frame["日均成交额"]))
+            self.assertEqual(days[0], date(2026, 6, 30))
+            self.assertEqual(days[-1], date(2026, 7, 2))
+            self.assertEqual(totals, [45.0, 90.0, 135.0])
+            self.assertEqual(amounts["510300"], 60.0)
+            self.assertEqual(amounts["159667"], 30.0)
+
+    def test_archive_rejects_intraday_cached_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hub = MarketDataHub(Path(directory))
+            hub.get_eastmoney_spot = lambda force=False: pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [100.0],
+                "数据日期": ["2026-07-03"],
+                "更新时间": ["2026-07-03 13:10:00"],
+            })
+            with self.assertRaises(DataSourceError):
+                hub.archive_eastmoney_spot(date(2026, 7, 3))
+
+    def test_fixed_pool_liquidity_uses_archived_amounts(self):
+        class FakeData:
+            @staticmethod
+            def get_archived_market_amounts(before_day, count):
+                return (
+                    pd.DataFrame({
+                        "代码": ["510300", "159667"],
+                        "名称": ["沪深300ETF", "工业母机ETF"],
+                        "日均成交额": [20.0, 5.0],
+                    }),
+                    [
+                        date(2026, 6, 30),
+                        date(2026, 7, 1),
+                        date(2026, 7, 2),
+                    ],
+                    [100.0, 100.0, 100.0],
+                )
+
+        strategy = object.__new__(LocalETFStrategy)
+        strategy.config = StrategyConfig()
+        strategy.data = FakeData()
+        selected = strategy._filter_by_liquidity(
+            ["510300.XSHG", "159667.XSHE"],
+            {},
+            10.0,
+            date(2026, 7, 3),
+        )
+        self.assertEqual(selected, ["510300.XSHG"])
+
+    def test_joinquant_reference_log_restores_ranked_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "joinquant.log"
+            path.write_text(
+                "\n".join([
+                    "2026-07-03 13:10:00 - INFO - start",
+                    ">>> 第一步：所有ETF按动量得分从大到小排序 <<<",
+                    "513290.XSHG 纳指生物: 动量得分: 4.7",
+                    "159502.XSHE 生物科技: 动量得分: 13.3",
+                    ">>> 第二步：符合全部过滤条件的ETF <<<",
+                ]),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                joinquant_pool_from_log(path, date(2026, 7, 3)),
+                ["513290.XSHG", "159502.XSHE"],
+            )
+
+    def test_cached_minute_lot_volume_is_normalized_to_shares(self):
+        frame = pd.DataFrame({
+            "time": ["2026-07-03 13:10:00"],
+            "open": [1.0],
+            "close": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "volume": [10_000],
+            "amount": [1_000_000],
+            "average": [1.0],
+        })
+        result = normalize_intraday(frame)
+        self.assertEqual(result.iloc[0]["volume"], 1_000_000)
+
+    def test_partial_afternoon_minute_cache_is_rejected(self):
+        target_day = date(2026, 6, 29)
+        partial = pd.DataFrame({
+            "time": pd.to_datetime([
+                "2026-06-29 13:48:00",
+                "2026-06-29 15:00:00",
+            ])
+        })
+        complete = pd.DataFrame({
+            "time": pd.to_datetime([
+                "2026-06-29 09:31:00",
+                "2026-06-29 13:10:00",
+            ])
+        })
+        self.assertFalse(intraday_covers_signal(partial, target_day))
+        self.assertTrue(intraday_covers_signal(complete, target_day))
+
+    def test_signal_quotes_are_cut_off_at_1310(self):
+        class FakeData:
+            @staticmethod
+            def get_intraday_histories(codes, target_day):
+                return {
+                    codes[0]: pd.DataFrame({
+                        "time": pd.to_datetime([
+                            f"{target_day} 09:30:00",
+                            f"{target_day} 13:10:00",
+                            f"{target_day} 13:11:00",
+                        ]),
+                        "open": [1.0, 1.1, 1.2],
+                        "close": [1.0, 1.1, 1.2],
+                        "high": [1.0, 1.1, 1.2],
+                        "low": [1.0, 1.1, 1.2],
+                        "volume": [100.0, 200.0, 400.0],
+                        "amount": [100.0, 220.0, 480.0],
+                        "source": ["fixture"] * 3,
+                    })
+                }
+
+            @staticmethod
+            def get_quotes(codes):
+                raise AssertionError(f"不应实时回退: {codes}")
+
+        strategy = object.__new__(LocalETFStrategy)
+        strategy.data = FakeData()
+        strategy.state = type(
+            "State", (), {"data": {"name_map": {"513290": "纳指生物"}}}
+        )()
+        code = "513290.XSHG"
+        histories = {
+            code: pd.DataFrame({
+                "date": [datetime(2026, 7, 2).date()],
+                "close": [1.0],
+            })
+        }
+        quotes, exact, fallback = strategy._signal_quotes(
+            [code], histories, datetime(2026, 7, 3, 13, 10)
+        )
+        self.assertEqual(exact, 1)
+        self.assertEqual(fallback, 0)
+        self.assertEqual(quotes[code].price, 1.1)
+        self.assertEqual(quotes[code].volume, 300.0)
 
     def test_state_store_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
