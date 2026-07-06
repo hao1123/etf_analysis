@@ -350,7 +350,32 @@ class LocalETFStrategy:
         return body
 
     def rebalance(self, now: datetime, dry_run: bool = False) -> str:
-        pool = self.state.data.get("filtered_pool") or list(self.config.fixed_pool)
+        if self._is_weak:
+            threshold, _, _ = self._liquidity_threshold(now.date())
+            liquidity_histories = self.data.get_histories(
+                self.config.global_pool, count=8
+            )
+            pool = self._filter_by_liquidity(
+                self.config.global_pool,
+                liquidity_histories,
+                float(threshold),
+                now.date(),
+            )
+            self.state.data["liquidity_threshold"] = threshold
+            self.state.data["filtered_pool"] = pool
+            self.state.save()
+            LOGGER.info(
+                "【午盘池校验】走弱期按三日收盘快照重算：门槛%.0f万元，"
+                "全球池%d→%d只",
+                float(threshold) / 1e4,
+                len(self.config.global_pool),
+                len(pool),
+            )
+        else:
+            pool = (
+                self.state.data.get("filtered_pool")
+                or list(self.config.fixed_pool)
+            )
         histories = self.data.get_histories(pool, count=70)
         signal_time = datetime.combine(now.date(), datetime_time(13, 10))
         quotes, exact_quote_count, fallback_quote_count = self._signal_quotes(
