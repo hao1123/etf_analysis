@@ -181,18 +181,54 @@ class ETFStrategyTests(unittest.TestCase):
             self.assertEqual(amounts["510300"], 45.0)
             self.assertEqual(amounts["501018"], 20.0)
 
-    def test_archive_rejects_intraday_cached_snapshot(self):
+    def test_archive_rejects_incomplete_extended_hours_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = MarketDataHub(Path(directory))
             hub.get_eastmoney_spot = lambda force=False: pd.DataFrame({
                 "代码": ["510300"],
                 "名称": ["沪深300ETF"],
                 "成交额": [100.0],
-                "数据日期": ["2026-07-03"],
-                "更新时间": ["2026-07-03 13:10:00"],
+                "数据日期": ["2026-07-06"],
+                "更新时间": ["2026-07-06 15:00:00"],
             })
             with self.assertRaises(DataSourceError):
-                hub.archive_eastmoney_spot(date(2026, 7, 3))
+                hub.archive_eastmoney_spot(date(2026, 7, 6))
+
+    def test_reset_and_close_titles_use_actual_run_time(self):
+        class FakeData:
+            _em_spot = "cached"
+            _ths_spot = "cached"
+
+            @staticmethod
+            def archive_eastmoney_spot(expected_day):
+                return Path("snapshot.csv"), 1, 100_000_000.0
+
+            @staticmethod
+            def get_quotes(codes):
+                return {}
+
+            @staticmethod
+            def source_summary():
+                return "测试数据源"
+
+        with tempfile.TemporaryDirectory() as directory:
+            strategy = object.__new__(LocalETFStrategy)
+            strategy.data = FakeData()
+            strategy.state = StateStore(Path(directory) / "state.json")
+            notices = []
+            strategy._notify = (
+                lambda subject, body, dry_run=False:
+                notices.append((subject, body, dry_run))
+            )
+
+            strategy.reset(datetime(2026, 7, 6, 15, 41), dry_run=True)
+            strategy.close(datetime(2026, 7, 6, 16, 1), dry_run=True)
+
+            self.assertEqual(len(notices), 2)
+            self.assertIn("[ETF策略 15:41]", notices[0][0])
+            self.assertIn("[ETF策略 16:01]", notices[1][0])
+            self.assertIsNone(strategy.data._em_spot)
+            self.assertIsNone(strategy.data._ths_spot)
 
     def test_fixed_pool_liquidity_uses_archived_amounts(self):
         class FakeData:

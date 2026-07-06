@@ -629,8 +629,11 @@ class LocalETFStrategy:
         self.data._ths_spot = None
         message = f"{now:%Y-%m-%d %H:%M:%S} 日内缓存已重置"
         LOGGER.info(message)
-        if dry_run:
-            print(message)
+        self._notify(
+            f"[ETF策略 {now:%H:%M}] 日内缓存重置 {now:%Y-%m-%d}",
+            message,
+            dry_run,
+        )
         return message
 
     def close(self, now: datetime, dry_run: bool = False) -> str:
@@ -679,7 +682,11 @@ class LocalETFStrategy:
         self.state.save()
         lines.extend(["", "【数据源】", self.data.source_summary()])
         body = "\n".join(lines)
-        self._notify(f"[ETF策略 15:30] 收盘记录 {now:%Y-%m-%d}", body, dry_run)
+        self._notify(
+            f"[ETF策略 {now:%H:%M}] 收盘记录 {now:%Y-%m-%d}",
+            body,
+            dry_run,
+        )
         return body
 
     def replay_day(
@@ -871,7 +878,7 @@ class LocalETFStrategy:
                 f"无风险资产目标；实盘逻辑将检查防御ETF "
                 f"{plain_code(self.config.defensive_etf)}。"
             )
-        lines.extend(["", "【15:30 收盘记录】"])
+        lines.extend(["", "【16:00 收盘记录】"])
         for item in targets:
             close_price, previous_close = daily_closes[item["etf"]]
             close_change = (

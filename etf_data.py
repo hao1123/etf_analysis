@@ -25,6 +25,7 @@ import requests
 
 HISTORY_CACHE_VERSION = "qfq_v2"
 SPOT_ARCHIVE_PREFIX = "etf_spot_close_"
+EXTENDED_TRADING_START = date(2026, 7, 6)
 
 warnings.filterwarnings(
     "ignore",
@@ -335,16 +336,21 @@ class MarketDataHub:
                 f"ETF快照日期为 {snapshot_day}，预期 {expected_day}"
             )
         latest_time = spot_frame_latest_time(frame)
+        required_time = (
+            datetime_time(15, 30)
+            if expected_day >= EXTENDED_TRADING_START
+            else datetime_time(15, 0)
+        )
         if (
             latest_time is not None
             and (
                 latest_time.date() != expected_day
-                or latest_time.time() < datetime_time(15, 0)
+                or latest_time.time() < required_time
             )
         ):
             raise DataSourceError(
                 f"ETF快照最新时间为 {latest_time:%Y-%m-%d %H:%M:%S}，"
-                "不是收盘快照"
+                f"未覆盖完整收盘时段（要求不早于 {required_time:%H:%M}）"
             )
         if "成交额" not in frame.columns:
             raise DataSourceError("ETF快照缺少成交额")
