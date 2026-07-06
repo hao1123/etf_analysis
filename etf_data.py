@@ -86,9 +86,15 @@ class DataSourceError(RuntimeError):
 
 
 class MarketDataHub:
-    def __init__(self, cache_dir: Path, request_timeout: int = 12) -> None:
+    def __init__(
+        self,
+        cache_dir: Path,
+        request_timeout: int = 12,
+        bootstrap_dir: Path | None = None,
+    ) -> None:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.bootstrap_dir = bootstrap_dir
         self.request_timeout = request_timeout
         self.session = requests.Session()
         self.session.trust_env = os.getenv("ETF_USE_SYSTEM_PROXY", "0") == "1"
@@ -361,22 +367,30 @@ class MarketDataHub:
         self, before_day: date, count: int = 3
     ) -> tuple[pd.DataFrame, list[date], list[float]]:
         """读取目标日前最近若干份收盘快照并计算逐ETF日均成交额。"""
-        archives: list[tuple[date, Path]] = []
-        for path in self.cache_dir.glob(f"{SPOT_ARCHIVE_PREFIX}*.csv"):
-            raw_day = path.stem.removeprefix(SPOT_ARCHIVE_PREFIX)
-            try:
-                archive_day = date.fromisoformat(raw_day)
-            except ValueError:
+        archive_map: dict[date, Path] = {}
+        archive_dirs = [self.cache_dir]
+        if self.bootstrap_dir is not None:
+            archive_dirs.insert(0, self.bootstrap_dir)
+        for archive_dir in archive_dirs:
+            if not archive_dir.exists():
                 continue
-            if archive_day < before_day:
-                archives.append((archive_day, path))
-        archives = sorted(archives, reverse=True)[:count]
+            for path in archive_dir.glob(f"{SPOT_ARCHIVE_PREFIX}*.csv"):
+                raw_day = path.stem.removeprefix(SPOT_ARCHIVE_PREFIX)
+                try:
+                    archive_day = date.fromisoformat(raw_day)
+                except ValueError:
+                    continue
+                if archive_day < before_day:
+                    # cache_dir is scanned last so a real archive replaces a seed.
+                    archive_map[archive_day] = path
+        archives = sorted(archive_map.items(), reverse=True)[:count]
         if not archives:
             return pd.DataFrame(), [], []
 
         frames: list[pd.DataFrame] = []
         days: list[date] = []
         totals: list[float] = []
+        bootstrap_days: list[date] = []
         for archive_day, path in reversed(archives):
             try:
                 frame = pd.read_csv(path, dtype={"代码": str})
@@ -393,12 +407,19 @@ class MarketDataHub:
             frames.append(frame)
             days.append(archive_day)
             totals.append(float(frame.loc[frame["成交额"] > 0, "成交额"].sum()))
+            if self.bootstrap_dir is not None and path.parent == self.bootstrap_dir:
+                bootstrap_days.append(archive_day)
         if not frames:
             return pd.DataFrame(), [], []
+        if bootstrap_days:
+            self._event(
+                "全市场ETF种子收盘快照: "
+                + ",".join(day.isoformat() for day in bootstrap_days)
+            )
 
         combined = pd.concat(frames, ignore_index=True)
         names = combined.groupby("代码", sort=False)["名称"].last()
-        amounts = combined.groupby("代码")["成交额"].sum() / len(frames)
+        amounts = combined.groupby("代码")["成交额"].mean()
         result = pd.DataFrame({
             "代码": amounts.index,
             "名称": amounts.index.map(names),

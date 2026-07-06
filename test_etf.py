@@ -123,6 +123,64 @@ class ETFStrategyTests(unittest.TestCase):
             self.assertEqual(amounts["510300"], 60.0)
             self.assertEqual(amounts["159667"], 30.0)
 
+    def test_real_archive_overrides_bootstrap_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_dir = root / "cache"
+            bootstrap_dir = root / "bootstrap"
+            cache_dir.mkdir()
+            bootstrap_dir.mkdir()
+            filename = f"{SPOT_ARCHIVE_PREFIX}2026-07-03.csv"
+            pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [10.0],
+            }).to_csv(bootstrap_dir / filename, index=False)
+            pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [30.0],
+            }).to_csv(cache_dir / filename, index=False)
+
+            hub = MarketDataHub(cache_dir, bootstrap_dir=bootstrap_dir)
+            frame, days, totals = hub.get_archived_market_amounts(
+                date(2026, 7, 6), 3
+            )
+
+            self.assertEqual(days, [date(2026, 7, 3)])
+            self.assertEqual(totals, [30.0])
+            self.assertEqual(frame.iloc[0]["日均成交额"], 30.0)
+            self.assertNotIn("种子收盘快照", hub.source_summary())
+
+    def test_archived_amount_mean_ignores_missing_snapshot_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [30.0],
+            }).to_csv(
+                cache_dir / f"{SPOT_ARCHIVE_PREFIX}2026-07-02.csv",
+                index=False,
+            )
+            pd.DataFrame({
+                "代码": ["510300", "501018"],
+                "名称": ["沪深300ETF", "南方原油LOF"],
+                "成交额": [60.0, 20.0],
+            }).to_csv(
+                cache_dir / f"{SPOT_ARCHIVE_PREFIX}2026-07-03.csv",
+                index=False,
+            )
+
+            hub = MarketDataHub(cache_dir)
+            frame, _, _ = hub.get_archived_market_amounts(
+                date(2026, 7, 6), 3
+            )
+            amounts = dict(zip(frame["代码"], frame["日均成交额"]))
+
+            self.assertEqual(amounts["510300"], 45.0)
+            self.assertEqual(amounts["501018"], 20.0)
+
     def test_archive_rejects_intraday_cached_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = MarketDataHub(Path(directory))

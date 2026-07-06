@@ -1040,14 +1040,35 @@ class LocalETFStrategy:
                     archived["日均成交额"], errors="coerce"
                 ).fillna(0),
             ))
-            selected = [
-                code for code in codes
-                if amount_map.get(plain_code(code), 0) > threshold
-            ]
+            selected = []
+            fallback_count = 0
+            for code in codes:
+                amount = amount_map.get(plain_code(code))
+                if amount is not None:
+                    if amount > threshold:
+                        selected.append(code)
+                    continue
+                frame = histories.get(code)
+                if frame is None:
+                    continue
+                completed = frame[frame["date"] < today].tail(
+                    self.config.liquidity_lookback_days
+                )
+                amounts = pd.to_numeric(
+                    completed["amount"], errors="coerce"
+                ).dropna()
+                if len(amounts) > 0 and float(amounts.mean()) > threshold:
+                    selected.append(code)
+                fallback_count += 1
             LOGGER.info(
                 "固定池流动性过滤使用收盘快照: %s",
                 ",".join(day.isoformat() for day in archive_days),
             )
+            if fallback_count > 0:
+                LOGGER.info(
+                    "固定池流动性过滤：%d 只快照缺失，回退使用历史成交额",
+                    fallback_count,
+                )
             return selected
 
         selected = []
@@ -1529,7 +1550,10 @@ def build_strategy() -> LocalETFStrategy:
         cache_dir=BASE_DIR / "data" / "cache",
     )
     state = StateStore(config.state_path)
-    data = MarketDataHub(config.cache_dir)
+    data = MarketDataHub(
+        config.cache_dir,
+        bootstrap_dir=BASE_DIR / "bootstrap" / "spot",
+    )
     return LocalETFStrategy(config, data, state, Mailer())
 
 
