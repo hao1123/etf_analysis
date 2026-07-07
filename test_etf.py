@@ -181,6 +181,77 @@ class ETFStrategyTests(unittest.TestCase):
             self.assertEqual(amounts["510300"], 45.0)
             self.assertEqual(amounts["501018"], 20.0)
 
+    def test_archived_market_amounts_require_expected_trade_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            pd.DataFrame({
+                "trade_date": [
+                    "2026-07-01",
+                    "2026-07-02",
+                    "2026-07-03",
+                    "2026-07-06",
+                    "2026-07-07",
+                ]
+            }).to_csv(cache_dir / "trade_dates.csv", index=False)
+            for raw_day, amount in [
+                ("2026-07-01", 10.0),
+                ("2026-07-02", 20.0),
+                ("2026-07-03", 30.0),
+            ]:
+                pd.DataFrame({
+                    "代码": ["510300"],
+                    "名称": ["沪深300ETF"],
+                    "成交额": [amount],
+                }).to_csv(
+                    cache_dir / f"{SPOT_ARCHIVE_PREFIX}{raw_day}.csv",
+                    index=False,
+                )
+
+            hub = MarketDataHub(cache_dir)
+            _, days, totals = hub.get_archived_market_amounts(
+                date(2026, 7, 7), 3
+            )
+
+            self.assertEqual(days, [date(2026, 7, 2), date(2026, 7, 3)])
+            self.assertEqual(totals, [20.0, 30.0])
+            self.assertIn("2026-07-06", hub.source_summary())
+
+    def test_archived_market_amounts_skip_abnormally_low_close_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            pd.DataFrame({
+                "trade_date": [
+                    "2026-07-01",
+                    "2026-07-02",
+                    "2026-07-03",
+                    "2026-07-06",
+                    "2026-07-07",
+                ]
+            }).to_csv(cache_dir / "trade_dates.csv", index=False)
+            for raw_day, amount in [
+                ("2026-07-01", 450_000_000_000.0),
+                ("2026-07-02", 530_000_000_000.0),
+                ("2026-07-03", 490_000_000_000.0),
+                ("2026-07-06", 340_000_000_000.0),
+            ]:
+                pd.DataFrame({
+                    "代码": ["510300"],
+                    "名称": ["沪深300ETF"],
+                    "成交额": [amount],
+                }).to_csv(
+                    cache_dir / f"{SPOT_ARCHIVE_PREFIX}{raw_day}.csv",
+                    index=False,
+                )
+
+            hub = MarketDataHub(cache_dir)
+            _, days, totals = hub.get_archived_market_amounts(
+                date(2026, 7, 7), 3
+            )
+
+            self.assertEqual(days, [date(2026, 7, 2), date(2026, 7, 3)])
+            self.assertEqual(totals, [530_000_000_000.0, 490_000_000_000.0])
+            self.assertIn("异常跳过: 2026-07-06", hub.source_summary())
+
     def test_archive_rejects_incomplete_extended_hours_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             hub = MarketDataHub(Path(directory))
@@ -193,6 +264,36 @@ class ETFStrategyTests(unittest.TestCase):
             })
             with self.assertRaises(DataSourceError):
                 hub.archive_eastmoney_spot(date(2026, 7, 6))
+
+    def test_archive_rejects_abnormally_low_close_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            for raw_day, amount in [
+                ("2026-07-02", 530_000_000_000.0),
+                ("2026-07-03", 490_000_000_000.0),
+            ]:
+                pd.DataFrame({
+                    "代码": ["510300"],
+                    "名称": ["沪深300ETF"],
+                    "成交额": [amount],
+                }).to_csv(
+                    cache_dir / f"{SPOT_ARCHIVE_PREFIX}{raw_day}.csv",
+                    index=False,
+                )
+            hub = MarketDataHub(cache_dir)
+            hub.get_eastmoney_spot = lambda force=False: pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [340_000_000_000.0],
+                "数据日期": ["2026-07-06"],
+                "更新时间": ["2026-07-06 16:00:00"],
+            })
+
+            with self.assertRaisesRegex(DataSourceError, "异常偏低"):
+                hub.archive_eastmoney_spot(date(2026, 7, 6))
+            self.assertFalse(
+                (cache_dir / f"{SPOT_ARCHIVE_PREFIX}2026-07-06.csv").exists()
+            )
 
     def test_reset_and_close_titles_use_actual_run_time(self):
         class FakeData:

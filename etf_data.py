@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import threading
 import time
 import warnings
@@ -26,6 +27,10 @@ import requests
 HISTORY_CACHE_VERSION = "qfq_v2"
 SPOT_ARCHIVE_PREFIX = "etf_spot_close_"
 EXTENDED_TRADING_START = date(2026, 7, 6)
+SPOT_ARCHIVE_MIN_TOTAL_RATIO = 0.75
+SPOT_ARCHIVE_MIN_BENCHMARK_DAYS = 2
+SPOT_ARCHIVE_BENCHMARK_DAYS = 5
+SPOT_ARCHIVE_ANOMALY_MIN_TOTAL = 100_000_000_000.0
 
 warnings.filterwarnings(
     "ignore",
@@ -359,13 +364,27 @@ class MarketDataHub:
             frame["成交额"], errors="coerce"
         ).fillna(0)
         frame["数据日期"] = expected_day.isoformat()
+        total = float(frame.loc[frame["成交额"] > 0, "成交额"].sum())
+        if total <= 0:
+            raise DataSourceError("ETF快照成交额为空，拒绝归档")
+        benchmark = self._recent_archive_totals_before(expected_day)
+        low, median_total = self._is_abnormally_low_archive_total(
+            total, benchmark
+        )
+        if low:
+            raise DataSourceError(
+                "ETF快照总成交额异常偏低："
+                f"{total / 1e8:.2f}亿元，低于近{len(benchmark)}日中位数"
+                f"{median_total / 1e8:.2f}亿元的"
+                f"{SPOT_ARCHIVE_MIN_TOTAL_RATIO:.0%}，拒绝归档"
+            )
         archive = self.cache_dir / (
             f"{SPOT_ARCHIVE_PREFIX}{expected_day.isoformat()}.csv"
         )
         frame.to_csv(archive, index=False)
-        total = float(frame.loc[frame["成交额"] > 0, "成交额"].sum())
         self._event(
-            f"全市场ETF收盘快照归档: {expected_day} {len(frame)}只"
+            f"全市场ETF收盘快照归档: {expected_day} {len(frame)}只，"
+            f"总成交额 {total / 1e8:.2f}亿元"
         )
         return archive, len(frame), total
 
@@ -373,50 +392,51 @@ class MarketDataHub:
         self, before_day: date, count: int = 3
     ) -> tuple[pd.DataFrame, list[date], list[float]]:
         """读取目标日前最近若干份收盘快照并计算逐ETF日均成交额。"""
-        archive_map: dict[date, Path] = {}
-        archive_dirs = [self.cache_dir]
-        if self.bootstrap_dir is not None:
-            archive_dirs.insert(0, self.bootstrap_dir)
-        for archive_dir in archive_dirs:
-            if not archive_dir.exists():
-                continue
-            for path in archive_dir.glob(f"{SPOT_ARCHIVE_PREFIX}*.csv"):
-                raw_day = path.stem.removeprefix(SPOT_ARCHIVE_PREFIX)
-                try:
-                    archive_day = date.fromisoformat(raw_day)
-                except ValueError:
-                    continue
-                if archive_day < before_day:
-                    # cache_dir is scanned last so a real archive replaces a seed.
-                    archive_map[archive_day] = path
-        archives = sorted(archive_map.items(), reverse=True)[:count]
-        if not archives:
+        archive_map = self._spot_archive_map(before_day)
+        expected_days = self._previous_trade_days(before_day, count)
+        archives = [(day, archive_map.get(day)) for day in expected_days]
+        if not any(path is not None for _, path in archives):
             return pd.DataFrame(), [], []
 
         frames: list[pd.DataFrame] = []
         days: list[date] = []
         totals: list[float] = []
         bootstrap_days: list[date] = []
-        for archive_day, path in reversed(archives):
-            try:
-                frame = pd.read_csv(path, dtype={"代码": str})
-            except (OSError, pd.errors.ParserError):
+        missing_days: list[date] = []
+        for archive_day, path in archives:
+            if path is None:
+                missing_days.append(archive_day)
                 continue
-            if not {"代码", "名称", "成交额"}.issubset(frame.columns):
+            archive_frame = self._read_spot_archive(path, archive_day)
+            if archive_frame is None:
                 continue
-            frame = frame[["代码", "名称", "成交额"]].copy()
-            frame["代码"] = frame["代码"].astype(str).str.zfill(6)
-            frame["成交额"] = pd.to_numeric(
-                frame["成交额"], errors="coerce"
-            ).fillna(0)
+            frame, total = archive_frame
+            benchmark = self._recent_archive_totals_before(archive_day)
+            low, median_total = self._is_abnormally_low_archive_total(
+                total, benchmark
+            )
+            if low:
+                self._event(
+                    "全市场ETF收盘快照异常跳过: "
+                    f"{archive_day} 总成交额 {total / 1e8:.2f}亿元，"
+                    f"低于近{len(benchmark)}日中位数"
+                    f"{median_total / 1e8:.2f}亿元的"
+                    f"{SPOT_ARCHIVE_MIN_TOTAL_RATIO:.0%}"
+                )
+                continue
             frame["archive_day"] = archive_day
             frames.append(frame)
             days.append(archive_day)
-            totals.append(float(frame.loc[frame["成交额"] > 0, "成交额"].sum()))
+            totals.append(total)
             if self.bootstrap_dir is not None and path.parent == self.bootstrap_dir:
                 bootstrap_days.append(archive_day)
         if not frames:
             return pd.DataFrame(), [], []
+        if missing_days:
+            self._event(
+                "全市场ETF收盘快照缺失: "
+                + ",".join(day.isoformat() for day in missing_days)
+            )
         if bootstrap_days:
             self._event(
                 "全市场ETF种子收盘快照: "
@@ -432,6 +452,108 @@ class MarketDataHub:
             "日均成交额": amounts.values,
         }).reset_index(drop=True)
         return result, days, totals
+
+    def _spot_archive_map(self, before_day: date | None = None) -> dict[date, Path]:
+        archive_map: dict[date, Path] = {}
+        archive_dirs = [self.cache_dir]
+        if self.bootstrap_dir is not None:
+            archive_dirs.insert(0, self.bootstrap_dir)
+        for archive_dir in archive_dirs:
+            if not archive_dir.exists():
+                continue
+            for path in archive_dir.glob(f"{SPOT_ARCHIVE_PREFIX}*.csv"):
+                raw_day = path.stem.removeprefix(SPOT_ARCHIVE_PREFIX)
+                try:
+                    archive_day = date.fromisoformat(raw_day)
+                except ValueError:
+                    continue
+                if before_day is None or archive_day < before_day:
+                    # cache_dir is scanned last so a real archive replaces a seed.
+                    archive_map[archive_day] = path
+        return archive_map
+
+    def _read_spot_archive(
+        self, path: Path, archive_day: date
+    ) -> tuple[pd.DataFrame, float] | None:
+        try:
+            frame = pd.read_csv(path, dtype={"代码": str})
+        except (OSError, pd.errors.ParserError):
+            return None
+        if not {"代码", "名称", "成交额"}.issubset(frame.columns):
+            return None
+        frame = frame[["代码", "名称", "成交额"]].copy()
+        frame["代码"] = frame["代码"].astype(str).str.zfill(6)
+        frame["成交额"] = pd.to_numeric(
+            frame["成交额"], errors="coerce"
+        ).fillna(0)
+        total = float(frame.loc[frame["成交额"] > 0, "成交额"].sum())
+        if total <= 0:
+            self._event(f"全市场ETF收盘快照异常跳过: {archive_day} 成交额为空")
+            return None
+        return frame, total
+
+    def _previous_trade_days(self, before_day: date, count: int) -> list[date]:
+        trade_dates = self._cached_trade_dates()
+        if trade_dates:
+            return sorted(
+                (day for day in trade_dates if day < before_day),
+                reverse=True,
+            )[:count][::-1]
+
+        days: list[date] = []
+        cursor = before_day - timedelta(days=1)
+        while len(days) < count:
+            if cursor.weekday() < 5:
+                days.append(cursor)
+            cursor -= timedelta(days=1)
+        return list(reversed(days))
+
+    def _cached_trade_dates(self) -> set[date]:
+        cache = self.cache_dir / "trade_dates.csv"
+        if not cache.exists():
+            return set()
+        try:
+            frame = pd.read_csv(cache)
+        except (OSError, pd.errors.ParserError):
+            return set()
+        if frame.empty:
+            return set()
+        column = "trade_date" if "trade_date" in frame.columns else frame.columns[0]
+        return set(pd.to_datetime(frame[column], errors="coerce").dropna().dt.date)
+
+    def _recent_archive_totals_before(
+        self, before_day: date, limit: int = SPOT_ARCHIVE_BENCHMARK_DAYS
+    ) -> list[float]:
+        archive_map = self._spot_archive_map(before_day)
+        totals: list[float] = []
+        for archive_day in sorted(archive_map, reverse=True):
+            archive_frame = self._read_spot_archive(archive_map[archive_day], archive_day)
+            if archive_frame is None:
+                continue
+            _, total = archive_frame
+            totals.append(total)
+            if len(totals) >= limit:
+                break
+        return totals
+
+    def _is_abnormally_low_archive_total(
+        self, total: float, benchmark_totals: list[float]
+    ) -> tuple[bool, float]:
+        benchmark = [
+            item
+            for item in benchmark_totals
+            if item >= SPOT_ARCHIVE_ANOMALY_MIN_TOTAL
+        ]
+        if (
+            len(benchmark) < SPOT_ARCHIVE_MIN_BENCHMARK_DAYS
+            or total < SPOT_ARCHIVE_ANOMALY_MIN_TOTAL
+        ):
+            return False, 0.0
+        median_total = float(statistics.median(benchmark))
+        return (
+            total < median_total * SPOT_ARCHIVE_MIN_TOTAL_RATIO,
+            median_total,
+        )
 
     def get_ths_spot(self, force: bool = False) -> pd.DataFrame:
         if self._ths_spot is not None and not force:

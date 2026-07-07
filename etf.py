@@ -280,6 +280,7 @@ class LocalETFStrategy:
             "【流动性门槛】",
             f"全市场ETF盘中快照日期：{snapshot_date or '未知'}",
             f"盘中快照总成交额：{total_amount / 1e8:.2f}亿元",
+            self._liquidity_archive_line(),
             f"筛选门槛：{threshold / 1e4:.0f}万元",
             f"说明：筛选门槛只取目标日前最近"
             f"{self.config.liquidity_lookback_days}份15:30收盘快照，"
@@ -928,7 +929,16 @@ class LocalETFStrategy:
         )
         if not recent_amounts:
             LOGGER.warning("流动性门槛回退：无收盘快照，使用1000万元")
+            self.state.data["daily_total_amounts"] = {}
+            self.state.data["liquidity_archive_days"] = []
             return self.config.fallback_liquidity_threshold, snapshot_date, snapshot_total
+        self.state.data["daily_total_amounts"] = {
+            day.isoformat(): total
+            for day, total in zip(archive_days, recent_amounts)
+        }
+        self.state.data["liquidity_archive_days"] = [
+            day.isoformat() for day in archive_days
+        ]
         avg_total = sum(recent_amounts) / len(recent_amounts)
         threshold = avg_total / 15_000 if avg_total > 0 else 0
         threshold = threshold or self.config.fallback_liquidity_threshold
@@ -938,6 +948,16 @@ class LocalETFStrategy:
             len(recent_amounts), avg_total / 1e8, threshold / 1e4,
         )
         return threshold, snapshot_date, snapshot_total
+
+    def _liquidity_archive_line(self) -> str:
+        totals = self.state.data.get("daily_total_amounts") or {}
+        if not totals:
+            return "门槛收盘快照：未取得"
+        parts = [
+            f"{day} {float(total) / 1e8:.2f}亿元"
+            for day, total in totals.items()
+        ]
+        return "门槛收盘快照：" + "，".join(parts)
 
     def _update_weak_state(self, today: date) -> tuple[list[str], bool]:
         histories = self.data.get_histories(INDEXES.values(), count=30, workers=4)
