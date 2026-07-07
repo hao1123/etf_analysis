@@ -334,7 +334,62 @@ class MarketDataHub:
         self, expected_day: date
     ) -> tuple[Path, int, float]:
         """归档收盘后的全市场ETF快照，供后续交易日使用。"""
-        frame = self.get_eastmoney_spot(force=True).copy()
+        benchmark = self._recent_archive_totals_before(expected_day)
+        frame, total = self._close_spot_frame_for_archive(
+            expected_day, benchmark
+        )
+        archive = self.cache_dir / (
+            f"{SPOT_ARCHIVE_PREFIX}{expected_day.isoformat()}.csv"
+        )
+        frame.to_csv(archive, index=False)
+        frame.to_csv(self.cache_dir / "eastmoney_etf_spot.csv", index=False)
+        self._em_spot = frame
+        self._event(
+            f"全市场ETF收盘快照归档: {expected_day} {len(frame)}只，"
+            f"总成交额 {total / 1e8:.2f}亿元"
+        )
+        return archive, len(frame), total
+
+    def _close_spot_frame_for_archive(
+        self, expected_day: date, benchmark: list[float]
+    ) -> tuple[pd.DataFrame, float]:
+        errors: list[str] = []
+        candidates: list[tuple[str, Callable[[], pd.DataFrame]]] = [
+            ("AkShare/东方财富ETF快照", lambda: self.get_eastmoney_spot(force=True)),
+            (
+                "东方财富ETF快照直连",
+                lambda: self._retry(
+                    "东方财富ETF快照直连", self._eastmoney_spot_direct, attempts=2
+                ),
+            ),
+            (
+                "同花顺列表/腾讯财经全市场快照",
+                lambda: self._retry(
+                    "同花顺列表/腾讯财经全市场快照",
+                    self._snapshot_from_tencent_ths,
+                    attempts=1,
+                ),
+            ),
+        ]
+        for label, provider in candidates:
+            try:
+                frame = provider().copy()
+                return self._prepare_archive_spot_frame(
+                    frame, expected_day, benchmark
+                )
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+                self._event(
+                    f"全市场ETF收盘快照候选无效: {label} ({exc})"
+                )
+        raise DataSourceError("；".join(errors))
+
+    def _prepare_archive_spot_frame(
+        self,
+        frame: pd.DataFrame,
+        expected_day: date,
+        benchmark: list[float],
+    ) -> tuple[pd.DataFrame, float]:
         snapshot_day = spot_frame_date(frame)
         if snapshot_day is not None and snapshot_day != expected_day:
             raise DataSourceError(
@@ -367,7 +422,6 @@ class MarketDataHub:
         total = float(frame.loc[frame["成交额"] > 0, "成交额"].sum())
         if total <= 0:
             raise DataSourceError("ETF快照成交额为空，拒绝归档")
-        benchmark = self._recent_archive_totals_before(expected_day)
         low, median_total = self._is_abnormally_low_archive_total(
             total, benchmark
         )
@@ -378,15 +432,7 @@ class MarketDataHub:
                 f"{median_total / 1e8:.2f}亿元的"
                 f"{SPOT_ARCHIVE_MIN_TOTAL_RATIO:.0%}，拒绝归档"
             )
-        archive = self.cache_dir / (
-            f"{SPOT_ARCHIVE_PREFIX}{expected_day.isoformat()}.csv"
-        )
-        frame.to_csv(archive, index=False)
-        self._event(
-            f"全市场ETF收盘快照归档: {expected_day} {len(frame)}只，"
-            f"总成交额 {total / 1e8:.2f}亿元"
-        )
-        return archive, len(frame), total
+        return frame, total
 
     def get_archived_market_amounts(
         self, before_day: date, count: int = 3
