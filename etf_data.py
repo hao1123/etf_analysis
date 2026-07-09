@@ -354,6 +354,7 @@ class MarketDataHub:
         self, expected_day: date, benchmark: list[float]
     ) -> tuple[pd.DataFrame, float]:
         errors: list[str] = []
+        valid_candidates: list[tuple[str, pd.DataFrame, float]] = []
         candidates: list[tuple[str, Callable[[], pd.DataFrame]]] = [
             ("AkShare/东方财富ETF快照", lambda: self.get_eastmoney_spot(force=True)),
             (
@@ -374,15 +375,27 @@ class MarketDataHub:
         for label, provider in candidates:
             try:
                 frame = provider().copy()
-                return self._prepare_archive_spot_frame(
+                frame, total = self._prepare_archive_spot_frame(
                     frame, expected_day, benchmark
                 )
+                valid_candidates.append((label, frame, total))
             except Exception as exc:
                 errors.append(f"{label}: {exc}")
                 self._event(
                     f"全市场ETF收盘快照候选无效: {label} ({exc})"
                 )
-        raise DataSourceError("；".join(errors))
+        if not valid_candidates:
+            raise DataSourceError("；".join(errors))
+
+        label, frame, total = max(valid_candidates, key=lambda item: item[2])
+        first_label, _, first_total = valid_candidates[0]
+        if label != first_label and total > first_total * 1.1:
+            self._event(
+                "全市场ETF收盘快照改用更完整候选: "
+                f"{label} {total / 1e8:.2f}亿元，"
+                f"原{first_label} {first_total / 1e8:.2f}亿元"
+            )
+        return frame, total
 
     def _prepare_archive_spot_frame(
         self,

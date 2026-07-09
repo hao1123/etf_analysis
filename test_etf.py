@@ -335,7 +335,7 @@ class ETFStrategyTests(unittest.TestCase):
                 ],
             })
             hub._snapshot_from_tencent_ths = lambda: (_ for _ in ()).throw(
-                DataSourceError("不应调用")
+                DataSourceError("备用源不可用")
             )
 
             _, count, total = hub.archive_eastmoney_spot(date(2026, 7, 6))
@@ -343,6 +343,53 @@ class ETFStrategyTests(unittest.TestCase):
             self.assertEqual(count, 2)
             self.assertEqual(total, 520_000_000_000.0)
             self.assertIn("候选无效: AkShare/东方财富ETF快照", hub.source_summary())
+
+    def test_archive_chooses_more_complete_alternate_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            for raw_day, amount in [
+                ("2026-07-02", 530_000_000_000.0),
+                ("2026-07-03", 490_000_000_000.0),
+            ]:
+                pd.DataFrame({
+                    "代码": ["510300"],
+                    "名称": ["沪深300ETF"],
+                    "成交额": [amount],
+                }).to_csv(
+                    cache_dir / f"{SPOT_ARCHIVE_PREFIX}{raw_day}.csv",
+                    index=False,
+                )
+            hub = MarketDataHub(cache_dir)
+            hub.get_eastmoney_spot = lambda force=False: pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [390_000_000_000.0],
+                "数据日期": ["2026-07-09"],
+                "更新时间": ["2026-07-09 16:12:00"],
+            })
+            hub._eastmoney_spot_direct = lambda: pd.DataFrame({
+                "代码": ["510300"],
+                "名称": ["沪深300ETF"],
+                "成交额": [390_000_000_000.0],
+                "数据日期": ["2026-07-09"],
+                "更新时间": ["2026-07-09 16:12:00"],
+            })
+            hub._snapshot_from_tencent_ths = lambda: pd.DataFrame({
+                "代码": ["510300", "159667"],
+                "名称": ["沪深300ETF", "工业母机ETF"],
+                "成交额": [500_000_000_000.0, 20_000_000_000.0],
+                "数据日期": ["2026-07-09", "2026-07-09"],
+                "更新时间": [
+                    "2026-07-09 16:15:00",
+                    "2026-07-09 16:15:00",
+                ],
+            })
+
+            _, count, total = hub.archive_eastmoney_spot(date(2026, 7, 9))
+
+            self.assertEqual(count, 2)
+            self.assertEqual(total, 520_000_000_000.0)
+            self.assertIn("改用更完整候选", hub.source_summary())
 
     def test_reset_and_close_titles_use_actual_run_time(self):
         class FakeData:
